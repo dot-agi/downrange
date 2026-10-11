@@ -1,0 +1,14 @@
+{
+  "name": "downrange",
+  "owner": { "name": "dot-agi" },
+  "description": "Downrange: progress, ETA, and last output for Claude Code background shells and Monitor watches, plus tool activity for subagents and state for workflow runs.",
+  "plugins": [
+    {
+      "name": "downrange",
+      "source": "./",
+      "description": "A band, pane, and /downrange table: progress, ETA, and last output for Claude Code background shells and Monitor watches, tool activity for subagents, state for workflows, and the next /loop wakeup.",
+      "category": "productivity",
+      "tags": ["mod", "background-tasks", "status", "progress", "eta"]
+    }
+  ]
+}
