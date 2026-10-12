@@ -74,7 +74,7 @@ Run all of them after each change. All must pass.
 - Write event names in `on(...)` as string literals. Write each matcher value as a literal or as a constant of `hooks/register.tsx`: `claude plugin validate` shows an imported constant as `?`. Use static imports only. Hooks run with no DOM and no Node.
 - Export every type in `types/index.d.ts`. `claude plugin validate` refuses a contract type without `export`.
 - Keep the other modules pure: no `$`, no I/O, and no clock reads. Pass `now` in.
-- Keep session values in `$.state` through the atoms. The only module variables are `ticker`, `isTicking`, `lastTickAt`, `latest`, `carry`, `historyWrites`, and `reported`.
+- Keep session values in `$.state` through the atoms. The only module variables are `ticker`, `isTicking`, `lastTickAt`, `latest`, `carry`, `historyWrites`, `reported`, and `isAnyRatio`, the `genericRatios` option that `register` sets.
 - Write `jobs` only through `writeJobs` and `wakeup` only through `writeWakeup`. They keep the carry's copy and the ticker current.
 - Render hooks never write state. Buttons write from their press handlers.
 - Give every `on(...)` registration a `.catch` that logs the failure under the hook's label, such as `tool.call{tool=Bash}`, and passes the event on with `next(e)`: write it as a function literal that calls `passOn`. `claude plugin validate` refuses a `.catch` that is not a function literal or the name of one. The `/downrange` command and the pane answer with the cause instead.
