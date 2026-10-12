@@ -2,6 +2,45 @@
 
 Downrange is a Claude Code mod, plugin `downrange`. It tracks the background tasks of a session and shows them in a band, a pane, and the `/downrange` table.
 
+## Install and update
+
+Install from a shell with Claude Code 2.1.292 or later. The second part turns on auto-update. It runs only when the install succeeds and the marketplace entry exists:
+
+```sh
+claude plugin install downrange --marketplace dot-agi/downrange --scope user --json \
+  && f="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" \
+  && jq -e --arg name downrange '.extraKnownMarketplaces[$name].source' "$f" > /dev/null \
+  && tmp=$(mktemp "$f.XXXXXX") \
+  && { jq --arg name downrange '.extraKnownMarketplaces[$name].autoUpdate = true' "$f" > "$tmp" && mv "$tmp" "$f" || { rm -f "$tmp"; false; }; }
+```
+
+Claude Code 2.1.288 to 2.1.291 has no `--marketplace` option. Add the marketplace first, then run the auto-update part above:
+
+```sh
+claude plugin marketplace add dot-agi/downrange --scope user --json \
+  && claude plugin install downrange@downrange --scope user --json
+```
+
+Auto-update runs only in interactive sessions. A headless job updates at its start, before the session that uses the mod:
+
+```sh
+claude plugin update downrange@downrange --json
+```
+
+Check the result. The first command prints the installed version. The second prints the latest release:
+
+```sh
+claude plugin list --json | jq -r '.[] | select(.id == "downrange@downrange") | "\(.version) enabled=\(.enabled)"' \
+  && git ls-remote --tags --refs https://github.com/dot-agi/downrange 'downrange--v*' | sed 's/.*--v//' | sort -V | tail -n 1
+```
+
+Notes:
+
+- On a host with no SSH key for GitHub, set `CLAUDE_CODE_PLUGIN_PREFER_HTTPS=1` in the environment of every `claude` command and session.
+- New code loads in the next session, or after `/reload-plugins`. An agent cannot type `/reload-plugins`, so it starts a new session.
+- Running `install` again does not update. Use `update`.
+- The `mv` replaces the settings file, with mode 600. If `settings.json` is a symbolic link, edit its target instead.
+
 ## Layout
 
 | Path | Holds |
