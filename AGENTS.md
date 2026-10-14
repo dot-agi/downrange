@@ -51,6 +51,7 @@ Notes:
 | `hooks/register.tsx` | Every hook, every `$` call, the command name and the pane constants, the state atoms, the writers, the ticker, the carry, and the diagnostics |
 | `hooks/limits.ts` | Every named limit |
 | `hooks/output.ts` | Clipping, display lines, progress, ETA math, durations, the output path rule, and the end of an output |
+| `hooks/redirect.ts` | The redirect rule: the one file that a background command's text sends its output to |
 | `hooks/notices.ts` | Task-notification parsing |
 | `hooks/jobs.ts` | Job builders and pure reducers |
 | `hooks/history.ts` | The usual-duration history |
@@ -80,7 +81,7 @@ Run all of them after each change. All must pass.
 - Give every `on(...)` registration a `.catch` that logs the failure under the hook's label, such as `tool.call{tool=Bash}`, and passes the event on with `next(e)`: write it as a function literal that calls `passOn`. `claude plugin validate` refuses a `.catch` that is not a function literal or the name of one. The `/downrange` command and the pane answer with the cause instead.
 - Start every diagnostic with `downrange: <event>: `, then the cause. Never log output text, prompt text, or a command line.
 - Add no network call, no file write, and no host command other than `tail -c` for outputs over 4 MiB.
-- Read only output files whose path matches the output path rule for the job's own id.
+- Read only two files of a job: its output file, whose path matches the output path rule for the job's own id, and its redirect file, the one regular file that `hooks/redirect.ts` finds in the job's command.
 - Look up words that come from the engine (statuses, task types, tool names) in a `Map`, never in a plain object.
 - In tests, stub every tool result, file, and process. A test never runs a real command.
 - Name each new limit in `hooks/limits.ts`.
