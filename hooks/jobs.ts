@@ -571,7 +571,8 @@ export function reloaded(jobs: readonly Job[], isAnyRatio: boolean, now: number)
 export function tailRead(jobs: readonly Job[], id: string, read: TailRead, now: number, isAnyRatio = false): Job[] {
   return jobs.map(original => {
     if (original.kind !== 'shell' || original.id !== id) return original
-    const lines = jobLinesOf(read.lines)
+    // Only Claude Code's output file ends with its closing line; a redirect file holds only what the job wrote.
+    const lines = read.redirectBytes === undefined ? jobLinesOf(read.lines) : read.lines
     const found = progressOf(lines.slice(-PROGRESS_LINES), now, isAnyRatio)
     const isRedirect = read.redirectBytes !== undefined
     const job: ShellJob = isRedirect === (original.redirectBytes !== undefined)
