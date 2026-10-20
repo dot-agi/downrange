@@ -10,8 +10,8 @@ const PART_STYLES: Readonly<Record<BandPart['tone'], { color?: string; dimColor?
   done: { dimColor: true },
 }
 
-/** The band: one line of counts and snippets, Open and Hide, and what other mods drew beneath. */
-export function bandTree(ui: Ui, parts: readonly BandPart[], actions: { open: () => void; hide: () => void }, below: RenderElement): RenderElement {
+/** The band: one line of counts and snippets, the key hint in the free room before Open and Hide when the row holds it, and what other mods drew beneath. */
+export function bandTree(ui: Ui, parts: readonly BandPart[], hint: string | undefined, actions: { open: () => void; hide: () => void }, below: RenderElement): RenderElement {
   const { Box, Text, Button } = ui
   return (
     <Box flexDirection="column">
@@ -23,6 +23,11 @@ export function bandTree(ui: Ui, parts: readonly BandPart[], actions: { open: ()
             ))}
           </Text>
         </Box>
+        {hint === undefined ? null : (
+          <Text key="hint" dimColor wrap="truncate-end">
+            {hint}
+          </Text>
+        )}
         <Button key="open" label="Open" hotkey="j" onPress={actions.open} />
         <Button key="hide" label="Hide" hotkey="h" dimColor onPress={actions.hide} />
       </Box>
