@@ -34,7 +34,7 @@ The band is one line above the prompt:
 - **Open** (`j`) opens the pane. **Hide** (`h`) hides the band until a new job starts.
 - Focus the band with Ctrl+X, then Tab, or a click before you use its keys. That chord is Claude Code's own `abovePrompt:focus` binding. Release Ctrl before you press Tab, because many terminals read Ctrl+Tab as next tab. In Emacs vterm, eat, or ansi-term, click the band, use `/downrange pane`, or rebind `abovePrompt:focus` with [`/keybindings`](https://code.claude.com/docs/en/keybindings#above-prompt-actions).
 - On the focused band, Tab moves between **Open** and **Hide**, Enter presses one, and Esc returns to the prompt.
-- When the row has free room after the counts and the snippets, the dim hint `ctrl+x tab to choose` shows just before **Open**. The hint never takes room from a snippet and never moves a button. A narrow or full band leaves it out.
+- When the row has free room after the counts and the snippets, the dim hint `ctrl+x tab to choose` shows just before **Open**. The hint never takes room from a snippet and never moves a button. A narrow or full band leaves it out. To decide, Downrange counts each character outside ASCII and its own band symbols as two cells, so a job title with accents, wide characters, or emoji can hide the hint a little earlier than needed.
 - A survey takes the band's place while it shows.
 - The option `band` turns the band off.
 
