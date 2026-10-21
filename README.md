@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/Claude_Code-2.1.288%2B-D97757" alt="Claude Code 2.1.288+">
   <img src="https://img.shields.io/badge/Claude_Code-mod-555555" alt="Claude Code mod">
   <img src="https://img.shields.io/badge/license-MIT-78997A" alt="License: MIT">
-  <img src="https://img.shields.io/badge/version-1.1.3-555555" alt="Version: 1.1.3">
+  <img src="https://img.shields.io/badge/version-1.1.4-555555" alt="Version: 1.1.4">
 </p>
 
 <p align="center"><strong>Progress and an ETA for background shells and Monitor watches, read from their real output or past runs, with no model request.</strong></p>
