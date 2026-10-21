@@ -252,7 +252,7 @@ export function bandOf(jobs: readonly Job[], wakeup: Wakeup | null, now: number,
 const BAND_KEY_HINT = 'ctrl+x tab to choose'
 
 /** The characters that Downrange itself draws in the band: glyphs, separators, and bar parts, each one cell wide. */
-const BAND_GLYPHS: ReadonlySet<string> = new Set([...'\u00b7\u2014\u2026\u2265\u2501\u2502\u2578\u257a\u2588\u2589\u258a\u258b\u258c\u258d\u258e\u258f\u25a0\u25b0\u25b1\u25cc\u25cf\u25f7\u2713\u2717'])
+const BAND_GLYPHS: ReadonlySet<string> = new Set([...'·—…≥━│╸╺█▉▊▋▌▍▎▏■▰▱◌●◷✓✗'])
 
 /** An upper bound of the display cells of text: one for ASCII and for the band's own glyphs, two for any other character, also a combining, joining, or format character. A wide character and an emoji sequence count at least as wide as a terminal draws them, so a room check never admits text that is wider than it measured. */
 export function cellsOf(text: string): number {
