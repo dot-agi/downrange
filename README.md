@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/Claude_Code-2.1.288%2B-D97757" alt="Claude Code 2.1.288+">
   <img src="https://img.shields.io/badge/Claude_Code-mod-555555" alt="Claude Code mod">
   <img src="https://img.shields.io/badge/license-MIT-78997A" alt="License: MIT">
-  <img src="https://img.shields.io/badge/version-1.1.2-555555" alt="Version: 1.1.2">
+  <img src="https://img.shields.io/badge/version-1.1.3-555555" alt="Version: 1.1.3">
 </p>
 
 <p align="center"><strong>Progress and an ETA for background shells and Monitor watches, read from their real output or past runs, with no model request.</strong></p>
@@ -139,7 +139,7 @@ Notes:
 | `c` in the focused pane | Clears finished jobs |
 | `x` in the focused pane | Closes the pane |
 
-Focus the band or the pane with Ctrl+X, then Tab, or a click. That chord is Claude Code's own `abovePrompt:focus` binding. Release Ctrl before you press Tab, because many terminals read Ctrl+Tab as next tab. In Emacs vterm, eat, or ansi-term, click the band, use `/downrange pane`, or rebind `abovePrompt:focus` with [`/keybindings`](https://code.claude.com/docs/en/keybindings#above-prompt-actions).
+Focus the band or the pane with Ctrl+X, then Tab, or a click. That chord is Claude Code's own `abovePrompt:focus` binding. Release Ctrl before you press Tab, because many terminals read Ctrl+Tab as next tab. On the focused band, Tab moves between **Open** and **Hide**, Enter presses one, and Esc returns to the prompt. When the band's row has free room, it shows the dim hint `ctrl+x tab to choose` just before **Open**. In Emacs vterm, eat, or ansi-term, click the band, use `/downrange pane`, or rebind `abovePrompt:focus` with [`/keybindings`](https://code.claude.com/docs/en/keybindings#above-prompt-actions).
 
 ## Options
 

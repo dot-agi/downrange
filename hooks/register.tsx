@@ -45,7 +45,7 @@ import { displayLinesOf, isOutputFileOf, jobBytesOf, jobLinesOf, oneLine, output
 import { jobsStateOf, wakeupStateOf } from './state'
 import { isStatusPrompt, normalizePrompt } from './prompt'
 import { redirectFileOf, redirectTargetOf } from './redirect'
-import { bandOf, isBandHidden, paneModelOf, tableOf } from './view'
+import { bandHintOf, bandOf, isBandHidden, paneModelOf, tableOf } from './view'
 
 /** The slash command, without its slash; declared here so that `claude plugin validate` resolves the matcher. */
 const COMMAND = 'downrange'
@@ -715,7 +715,8 @@ export const register: Register = (on, options) => {
         void pressed($, 'Hide')
       },
     }
-    return bandTree($.ui.resolve(e), bandOf(jobs, wakeup, now, e.props.bodyColumns), actions, await next(e))
+    const parts = bandOf(jobs, wakeup, now, e.props.bodyColumns)
+    return bandTree($.ui.resolve(e), parts, bandHintOf(parts, e.props.bodyColumns), actions, await next(e))
   }).catch(($, e, next) => passOn($, 'ui.render{component=AbovePrompt}', e, next))
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {

@@ -248,6 +248,25 @@ export function bandOf(jobs: readonly Job[], wakeup: Wakeup | null, now: number,
   return [...joined(counts, '  '), ...divider, ...joined(snippets, ' · ')]
 }
 
+/** The band's sign of its keyboard path, drawn dim in the free room right before its first Button. */
+const BAND_KEY_HINT = 'ctrl+x tab to choose'
+
+/** The characters that Downrange itself draws in the band: glyphs, separators, and bar parts, each one cell wide. */
+const BAND_GLYPHS: ReadonlySet<string> = new Set([...'\u00b7\u2014\u2026\u2265\u2501\u2502\u2578\u257a\u2588\u2589\u258a\u258b\u258c\u258d\u258e\u258f\u25a0\u25b0\u25b1\u25cc\u25cf\u25f7\u2713\u2717'])
+
+/** An upper bound of the display cells of text: one for ASCII and for the band's own glyphs, two for any other character, also a combining, joining, or format character. A wide character and an emoji sequence count at least as wide as a terminal draws them, so a room check never admits text that is wider than it measured. */
+export function cellsOf(text: string): number {
+  let cells = 0
+  for (const char of text) cells += (char.codePointAt(0) ?? 0) < 0x80 || BAND_GLYPHS.has(char) ? 1 : 2
+  return cells
+}
+
+/** The key hint when the row holds it after the band line, before the Buttons, with a one-cell gap; the band line keeps all its room, in display cells. */
+export function bandHintOf(parts: readonly BandPart[], columns: number): string | undefined {
+  const line = parts.reduce((sum, part) => sum + cellsOf(part.text), 0)
+  return line + 1 + cellsOf(BAND_KEY_HINT) + BAND_BUTTONS_COLUMNS <= columns ? BAND_KEY_HINT : undefined
+}
+
 /** Hidden: the user pressed Hide, and no job started after that. */
 export function isBandHidden(jobs: readonly Job[], hiddenAt: number | null): boolean {
   return hiddenAt !== null && jobs.every(job => job.startedAt <= hiddenAt)
