@@ -10,12 +10,15 @@ const PART_STYLES: Readonly<Record<BandPart['tone'], { color?: string; dimColor?
   done: { dimColor: true },
 }
 
-/** The band: one line of counts and snippets, the key hint in the free room before Open and Hide when the row holds it, and what other mods drew beneath. */
+/**
+ * The band: one blank row, so the band does not look like the last line of the transcript, then one line of counts
+ * and snippets, the key hint in the free room before Open and Hide when the row holds it, and what other mods drew beneath.
+ */
 export function bandTree(ui: Ui, parts: readonly BandPart[], hint: string | undefined, actions: { open: () => void; hide: () => void }, below: RenderElement): RenderElement {
   const { Box, Text, Button } = ui
   return (
     <Box flexDirection="column">
-      <Box key="band" flexDirection="row" gap={1}>
+      <Box key="band" flexDirection="row" gap={1} marginTop={1}>
         <Box flexGrow={1}>
           <Text wrap="truncate-end">
             {parts.map(part => (
