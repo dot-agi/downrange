@@ -421,8 +421,36 @@ export function reconciled(jobs: readonly Job[], snapshot: readonly SnapshotTask
   return [...updated, ...discovered]
 }
 
-/** What one read of a job's output found. */
-export type TailRead = { bytes: number; mtimeMs: number; lines: readonly string[]; redirectBytes?: number }
+/**
+ * What one read of a job's output found. exitCode is the code on Claude Code's closing `[exited with code N]` line,
+ * when the read took the end of the output file and that end is the closing line: the command ended.
+ */
+export type TailRead = { bytes: number; mtimeMs: number; lines: readonly string[]; redirectBytes?: number; exitCode?: number }
+
+/**
+ * A running shell that the closing line of its output file ended, at a read that began at `now`: completed for exit
+ * code 0, else failed, with that code. Claude Code writes that line when the command ends, so the end needs no
+ * notification and no turn-end snapshot. The read was the job's final read, so the end asks for no other one.
+ */
+function closed(job: ShellJob, exitCode: number | undefined, now: number): ShellJob {
+  if (exitCode === undefined || !isRunning(job)) return job
+  const end = endedJob(job, exitCode === 0 ? 'completed' : 'failed', now, { exitCode })
+  return end === job ? job : { ...end, finalReadAskedAt: job.finalReadAskedAt }
+}
+
+/**
+ * The run that a read's closing line ends cleanly, as cleanRunsOf does for a notification: exit code 0, a shell job
+ * still running, seen from launch, with a history key, and an end no earlier than its start. The notification that
+ * comes later finds the row ended, so it adds no second run.
+ */
+export function closedRuns(jobs: readonly Job[], id: string, exitCode: number | undefined, now: number): HistoryRun[] {
+  if (exitCode !== 0) return []
+  return jobs.flatMap(job =>
+    job.kind === 'shell' && job.id === id && isRunning(job) && canEnd(job, now) && now >= job.startedAt && job.isStartSeen && job.historyKey !== undefined
+      ? [{ key: job.historyKey, durationMs: now - job.startedAt }]
+      : [],
+  )
+}
 
 /** Notes a successful read clears. */
 const READ_NOTES: ReadonlySet<string> = new Set(['output unavailable', 'tail failed'])
@@ -566,7 +594,8 @@ export function reloaded(jobs: readonly Job[], isAnyRatio: boolean, now: number)
  * The list after a read that began at `now`: size, time, last line, and progress; a read-problem note clears, and a
  * later end keeps its final read. A read of the redirect file carries that file's size and time. A read of the other
  * file than the one the row shows replaces the row's last line, progress, and anchor with that file's. isAnyRatio (the
- * `genericRatios` option) lets any ratio count as progress.
+ * `genericRatios` option) lets any ratio count as progress. A read whose output file ends with the closing line ends a
+ * running row (see closed).
  */
 export function tailRead(jobs: readonly Job[], id: string, read: TailRead, now: number, isAnyRatio = false): Job[] {
   return jobs.map(original => {
@@ -582,7 +611,7 @@ export function tailRead(jobs: readonly Job[], id: string, read: TailRead, now: 
     const isUnchanged = (isRedirect ? read.redirectBytes === job.redirectBytes : read.bytes === job.outputBytes) && job.failedReadBytes === undefined
     const progress = isUnchanged && isSameReading(found, job.progress) ? undefined : found
     const lastLine = lines.at(-1)
-    return {
+    return closed({
       ...job,
       outputBytes: read.bytes,
       ...(isRedirect ? { redirectBytes: read.redirectBytes } : {}),
@@ -595,22 +624,26 @@ export function tailRead(jobs: readonly Job[], id: string, read: TailRead, now: 
       lastLine: lastLine === undefined ? job.lastLine : clip(lastLine, LINE_MAX),
       progress: progress ?? job.progress,
       anchor: progress === undefined ? job.anchor : anchorOf(job.anchor, progress, job.progress),
-    }
+    }, read.exitCode, now)
   })
 }
 
-/** The list after a read that began at `now` failed: the next try waits its interval, a failed final read is not tried again unless a later end asked, and a launch or end note wins over a read note. */
-export function readFailed(jobs: readonly Job[], id: string, note: 'output unavailable' | 'tail failed', now: number, bytes?: number): Job[] {
+/**
+ * The list after a read that began at `now` failed: the next try waits its interval, a failed final read is not tried
+ * again unless a later end asked, and a launch or end note wins over a read note. A failed read of the redirect file
+ * after a read of the output file that ended with the closing line still ends a running row with that `exitCode`.
+ */
+export function readFailed(jobs: readonly Job[], id: string, note: 'output unavailable' | 'tail failed', now: number, bytes?: number, exitCode?: number): Job[] {
   return jobs.map(job =>
     job.kind === 'shell' && job.id === id
-      ? {
+      ? closed({
           ...job,
           lastReadAt: now,
           successfulReadAt: undefined,
           failedReadBytes: bytes ?? job.failedReadBytes,
           finalReadAskedAt: askedSince(job, now),
           note: job.note === undefined || READ_NOTES.has(job.note) ? note : job.note,
-        }
+        }, exitCode, now)
       : job,
   )
 }
