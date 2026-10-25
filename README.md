@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/Claude_Code-2.1.288%2B-D97757" alt="Claude Code 2.1.288+">
   <img src="https://img.shields.io/badge/Claude_Code-mod-555555" alt="Claude Code mod">
   <img src="https://img.shields.io/badge/license-MIT-78997A" alt="License: MIT">
-  <img src="https://img.shields.io/badge/version-1.1.5-555555" alt="Version: 1.1.5">
+  <img src="https://img.shields.io/badge/version-1.1.6-555555" alt="Version: 1.1.6">
 </p>
 
 <p align="center"><strong>Progress and an ETA for background shells and Monitor watches, read from their real output or past runs, with no model request.</strong></p>
@@ -28,7 +28,7 @@ Downrange reads that output on your machine and shows where each job stands.
 - **The background tasks of your session.** Shell commands (`run_in_background`, ctrl+b, or a command moved at its timeout), Monitor watches, background and remote subagents, teammates, workflow runs, and the pending dynamic `/loop` wakeup. For background sessions, use agent view (`claude agents`).
 - **Liveness flags.** `quiet 3m 00s` for a shell command or subagent that stayed silent for 2 minutes or more, and `3 failed calls in a row` for a struggling subagent.
 - **A table that prints mid-turn.** `/downrange` answers at once, even while Claude works. With the `answerStatusPrompts` option on, a prompt such as `status?` gets the same table.
-- **In step with Claude Code.** At each turn end, Downrange checks its rows against Claude Code's task list. It adds tasks it missed, and marks a job that left the list `ended without a report`. Running jobs carry across `/clear`, `/resume`, and `/branch`.
+- **In step with Claude Code.** At each turn end, Downrange checks its rows against Claude Code's task list. It adds tasks it missed, and marks a job that left the list `ended without a report`. Running jobs stay in view across `/clear`, `/resume`, and `/branch`.
 - **Read-only by design.** Downrange never stops or changes a task. Built-in `/tasks` stops tasks.
 
 ![Pane above the prompt shows three running jobs: count to 90 with a progress bar at 15/90, a wait 40s subagent, and a Monitor watch.](docs/images/pane.svg)
@@ -45,15 +45,14 @@ The [usage guide](docs/usage.md) explains every view, symbol, note, and message.
 
 ```mermaid
 flowchart LR
-    L["Tool calls: launches, wakeups, stops, subagent activity"] --> S[("Jobs and wakeup in session state")]
+    L["Tool calls: launches, wakeups, stops, subagent activity"] --> S[("Jobs and wakeup in memory, one list per process")]
     N["Task notifications"] --> S
     P["Stop and SubagentStop snapshots of tasks and crons"] --> S
     T["Ticker, once a second while work is live"] -->|"output file ends, agent list"| S
     N -->|"clean shell runs"| H[("Usual durations under hashed keys")]
     H -->|"usual duration at launch"| S
-    S --> V["Band, pane, and /downrange table"]
-    S -->|"session end"| C["Carry for /clear, /resume, /branch"]
-    C --> S
+    S -->|"each change, and each new session"| M[("Copy of the session's view in session state")]
+    M --> V["Band, pane, and /downrange table"]
 ```
 
 - **Launches.** Hooks on the Bash, Monitor, Agent, and Workflow tools record each background launch with its id and title, and a shell's output file. A ScheduleWakeup result sets the wakeup. A TaskStop result marks its job stopped.
@@ -61,7 +60,7 @@ flowchart LR
 - **Redirect files.** Some commands send their output to a file, such as `> build.log` or `| tee build.log`. The ticker then also reads the one file that the command's text names, its redirect file, in the same way. At each read, the row shows the file that changed last: Claude Code's output file or the redirect file. On equal times, it shows Claude Code's output file. While the row shows the redirect file, it notes `output: build.log`. The end and the exit code still come from Claude Code's notification. Downrange follows no redirect file on Windows, or in a command with code that may not run, such as an `if` or a function.
 - **Ends.** Task notifications end jobs and carry Monitor events. The agent list updates subagent states. Stop and SubagentStop snapshots add tasks that Downrange missed, and end tasks that left the list after a 10-second grace period. A scheduled prompt that fires from 5 seconds before the wakeup's due time clears the wakeup. So does a snapshot with no one-shot schedule, after the same grace period.
 - **Usual durations.** A clean end (exit code 0 or none) of a shell that Downrange saw start adds its run time to a history keyed by a hash of folder and command. The usual-duration ETA is the median of the last 5 runs.
-- **Views and carry.** The band, the pane, and `/downrange` draw from the same state. The ticker stops when nothing is live. At session end, Downrange keeps the running jobs and the wakeup in memory, and restores them after `/clear`, `/resume`, or `/branch`.
+- **Views and session changes.** Downrange keeps the jobs and the wakeup in its own memory, which `/clear`, `/resume`, and `/branch` do not touch. After each change, it writes a copy of the session's view to session state, and the band, the pane, and `/downrange` draw from that copy. So the new session shows the running jobs and the wakeup at once, with their ages, last lines, progress, ETAs, and file reads. Each session shows the jobs that ended after it started. **Hide** does not carry. The ticker stops when nothing is live.
 
 ## Install
 
@@ -225,7 +224,7 @@ Downrange watches events and changes almost none of them. It makes no network re
 
   It also reads the session's working folder, to hash it with a command and to place a relative redirect file, and the list of the session's agents and their states.
 - **Conversation data it reads.** The input and result of the tool calls in the hook table below: a command or description, the task id, the output file path, and the wakeup time and reason. Downrange reads a background command's text to find its redirect file. One input field of each tool call a tracked subagent makes (see the last item). Task notifications. The `background_tasks` and `session_crons` lists of Stop and SubagentStop hooks. The text of a prompt you type, only when `answerStatusPrompts` is on, to compare it with the status phrases. Downrange reads no transcript file.
-- **What it keeps.** Session state, which Claude Code holds for the session and which other mods in the session can read. It holds job titles, last output lines, notes, tool summaries, and the wakeup's reason, each cut to 200 characters or fewer. It also holds task ids, output file paths, redirect file paths, progress, exit codes, times, and the last status prompt it answered. The duration store holds run times under a hash of folder and command, with no command text, no path, and no output.
+- **What it keeps.** Memory, while Claude Code runs, and a copy of the session's view in session state, which Claude Code holds for the session and which other mods in the session can read. They hold job titles, last output lines, notes, tool summaries, and the wakeup's reason, each cut to 200 characters or fewer. It also holds task ids, output file paths, redirect file paths, progress, exit codes, times, and the last status prompt it answered. The duration store holds run times under a hash of folder and command, with no command text, no path, and no output.
 - **Permissions.** Downrange never changes a permission decision. No hook denies or approves a call, rewrites a tool's input, or answers a permission prompt. Claude Code and you decide as before. `claude plugin validate` lists most hooks as gating hooks with a `.catch`, because their events can block. Each such `.catch`, such as the one on `classic.SessionStart` in `hooks/register.tsx`, only logs the failure and passes the event on unchanged with `next(e)`. The `/downrange` command and the Jobs pane show the failure instead.
 - **The `Reflect.get` call in `hooks/jobs.ts`.** It reads one named field of a tracked subagent's tool input, from a fixed list in that file. The fields are `command` for Bash and Monitor, the file name from `file_path` or `notebook_path`, the `pattern` of Grep and Glob, the host of a WebFetch `url`, the `query` of WebSearch, and the `description` of Agent. That field becomes a summary such as `Edit: view.ts`, cut to 60 characters. Each tool's input has its own shape, so the code reads the field by name. It calls no function and reads no other field. Other tools show only their name.
 
@@ -234,9 +233,9 @@ Downrange watches events and changes almost none of them. It makes no network re
 
 | Event | What the hook does | What it changes |
 | --- | --- | --- |
-| `session.start` | Registers `/downrange`, and loads the session's jobs and wakeup | Nothing |
-| `session.end` | Keeps the running jobs and the wakeup in memory for the next session | Nothing |
-| `classic.SessionStart` after `/clear`, `/resume`, or `/branch` | Puts the kept jobs and wakeup back, and starts the once-a-second timer | Nothing. It adds no context, instructions, or settings |
+| `session.start` | Registers `/downrange`, and loads the jobs and the wakeup from session state into memory, as after a reload | Nothing |
+| `session.end` | On `/clear`, `/resume`, or `/branch`: notes the time, where the next session's **Finished** starts | Nothing |
+| `classic.SessionStart` after `/clear`, `/resume`, or `/branch` | Takes the new session's id from the event, writes that session's view of the jobs and the wakeup to session state, and starts the once-a-second timer | Nothing. It adds no context, instructions, or settings |
 | `command.run` for `downrange` only | Prints the table for `/downrange`, and opens or closes the pane for `/downrange pane` | Only its own command |
 | `tool.call` for Bash, Monitor, Agent, Workflow, ScheduleWakeup, and TaskStop | Lets the call run, then reads its result to record a background launch, the wakeup, or a stop | Nothing. The call's input and result stay as they were |
 | `tool.call` for any tool | For a subagent that Downrange tracks, counts the call and keeps a short summary of it | Nothing |

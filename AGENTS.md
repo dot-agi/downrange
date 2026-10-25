@@ -48,7 +48,7 @@ Notes:
 | `.claude-plugin/plugin.json` | The manifest, the options, and the state contract path |
 | `.claude-plugin/marketplace.json` | The one-plugin marketplace |
 | `hooks/hooks.json` | The name of the hooks module, `./register.tsx` |
-| `hooks/register.tsx` | Every hook, every `$` call, the command name and the pane constants, the state atoms, the writers, the ticker, the carry, and the diagnostics |
+| `hooks/register.tsx` | Every hook, every `$` call, the command name and the pane constants, the state atoms, the memory and its mirror, the writers, the ticker, and the diagnostics |
 | `hooks/limits.ts` | Every named limit |
 | `hooks/output.ts` | Clipping, display lines, progress, ETA math, durations, the output path rule, and the end of an output |
 | `hooks/redirect.ts` | The redirect rule: the one file that a background command's text sends its output to |
@@ -75,8 +75,8 @@ Run all of them after each change. All must pass.
 - Write event names in `on(...)` as string literals. Write each matcher value as a literal or as a constant of `hooks/register.tsx`: `claude plugin validate` shows an imported constant as `?`. Use static imports only. Hooks run with no DOM and no Node.
 - Export every type in `types/index.d.ts`. `claude plugin validate` refuses a contract type without `export`.
 - Keep the other modules pure: no `$`, no I/O, and no clock reads. Pass `now` in.
-- Keep session values in `$.state` through the atoms. The only module variables are `ticker`, `isTicking`, `lastTickAt`, `latest`, `carry`, `historyWrites`, `reported`, and `isAnyRatio`, the `genericRatios` option that `register` sets.
-- Write `jobs` only through `writeJobs` and `wakeup` only through `writeWakeup`. They keep the carry's copy and the ticker current.
+- Keep the jobs and the wakeup in module memory, `memory`: it is the source of truth, and it survives `/clear`, `/resume`, and `/branch`. `$.state` holds a mirror of the current session's view for drawing, and **Hide** and the last answered status prompt as atoms. The only module variables are `ticker`, `isTicking`, `lastTickAt`, `memory`, `since`, `sessions`, `switchedAt`, `mirror`, `historyWrites`, `reported`, and `isAnyRatio`, the `genericRatios` option that `register` sets.
+- Change `memory.jobs` only through `writeJobs` and `memory.wakeup` only through `writeWakeup`: they change memory at once, then write the mirror through `mirrored`, wait until a write that holds the change has landed, and keep the ticker current. A failed write is no failure of the hook (see `persisted`): memory took the change, so the rest of the hook runs. Each hook passes one `deadlineOf()` to all its writes: it waits `MIRROR_WAIT_MS` at most in all, and a wait that passes its deadline leaves the write's waiters. A reload of the mod empties module variables and keeps `$.state`: only `loaded`, at the first `session.start`, change of memory, or mirror write, reads the jobs and the wakeup from `$.state` into memory. Each change of memory waits for that read and applies on top of it, and no mirror write goes out before it. The mirror keeps a removal for each ended job that the session does not show (see `viewedJobs`). Read the mirror only to draw: in a render hook, `/downrange`, and the status answer.
 - Render hooks never write state. Buttons write from their press handlers.
 - Give every `on(...)` registration a `.catch` that logs the failure under the hook's label, such as `tool.call{tool=Bash}`, and passes the event on with `next(e)`: write it as a function literal that calls `passOn`. `claude plugin validate` refuses a `.catch` that is not a function literal or the name of one. The `/downrange` command and the pane answer with the cause instead.
 - Start every diagnostic with `downrange: <event>: `, then the cause. Never log output text, prompt text, or a command line.

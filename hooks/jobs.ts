@@ -662,7 +662,7 @@ export function observedJobs(state: JobsState, input: JobObservation, change: (j
   return next === state ? state : capped(next)
 }
 
-/** observedJobs before the cap. restoredJobs applies the cap once, after the whole carry, so a carried row never counts. */
+/** observedJobs before the cap. restoredJobs applies the cap once, after the whole state it lays over, so a row of it never counts. */
 function ordered(state: JobsState, input: JobObservation, change: (jobs: Job[]) => Job[]): JobsState {
   if (input.noticeRow !== undefined && state.noticeRows?.includes(input.noticeRow)) return state
   if (input.kind === 'snapshot' && input.at < (state.snapshotAt ?? -Infinity)) return state
@@ -718,7 +718,10 @@ function ordered(state: JobsState, input: JobObservation, change: (jobs: Job[]) 
   }
 }
 
-/** Restores the carry through the same ordering rule, using original observation and removal times, then applies the cap once. */
+/**
+ * Lays `carried` over `state` through the same ordering rule, using its original observation and removal times, then
+ * applies the cap once. The hooks no longer use it: the ordering tests keep it as the reference for the rule.
+ */
 export function restoredJobs(state: JobsState, carried: JobsState): JobsState {
   let restored = state
   for (const [id, at] of carried.removed) {
@@ -737,6 +740,22 @@ export function restoredJobs(state: JobsState, carried: JobsState): JobsState {
   }
   return capped({ ...restored, snapshotAt: saved.snapshotAt, snapshotIds: saved.snapshotIds,
     noticeRows: [...new Set([...(state.noticeRows ?? []), ...(carried.noticeRows ?? [])])].slice(-NOTICE_ROWS_MAX) })
+}
+
+/**
+ * The jobs that a session shows: every running job, and the ended jobs from `since` on. Each ended job that it does not
+ * show keeps a removal, as a cleared row does, and the cap bounds them: a reload that starts from this view still
+ * refuses the late inputs of those jobs.
+ */
+export function viewedJobs(state: JobsState, since: number): JobsState {
+  const isShown = (job: Job): boolean => isRunning(job) || (job.endedAt ?? -Infinity) >= since
+  if (state.items.every(isShown)) return state
+  const observed = new Map(state.observed)
+  const removed = new Map(state.removed)
+  for (const job of state.items) {
+    if (!isShown(job)) removed.set(job.id, Math.max(removed.get(job.id) ?? -Infinity, observed.get(job.id) ?? job.lastEndedAt ?? job.startedAt))
+  }
+  return capped({ ...state, items: state.items.filter(isShown), removed: [...removed] })
 }
 
 /** Live: a job runs, a wakeup is pending, or a job ended less than RECENT_MS ago. */

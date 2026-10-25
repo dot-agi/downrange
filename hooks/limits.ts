@@ -74,7 +74,7 @@ export const PANE_FIXED_COLUMNS = 44
 
 /** Stored child rows retained for duplicate suppression. */
 export const NOTICE_ROWS_MAX = 256
-/** Compare-and-set attempts before reporting a busy state. */
-export const STATE_WRITE_ATTEMPTS = 8
-/** Restore attempts per destination session. */
-export const CARRY_ATTEMPTS = 3
+/** The longest wait of a hook for the mirror write that holds its change; past it, the hook goes on with the change in memory only. */
+export const MIRROR_WAIT_MS = 2_000
+/** Sessions of one process whose start time for Finished stays in memory, for a /resume back to them; the oldest goes first. */
+export const MAX_SESSIONS = 32
