@@ -375,9 +375,9 @@ async function seeded($: EngineInterface): Promise<void> {
  * first, and so does each tick. A zero-delay timer that session.end starts calls it once at once, before the first tick
  * (see settledAtOnce). A command.run hook for every command calls it before the command runs, and a config.set hook for
  * every key before the row changes, so that a reload of the mod that a command, such as /reload-plugins, or a change of
- * an option causes finds the view in `$.state`. Both then wait for the write of a settle that is under way (see
- * settleLanded). Once `$.session.id()` answers an id other than the ended session's, that id is the new session, once.
- * After a /clear it starts at the switch. After a /resume or a /branch, which the mod cannot tell apart here, a session
+ * an option causes finds the view in `$.state`. Both then wait for the write of a settle that is under way, and write
+ * the view once more when the last write failed (see settleLanded). Once `$.session.id()` answers an id other than the
+ * ended session's, that id is the new session, once. After a /clear it starts at the switch. After a /resume or a /branch, which the mod cannot tell apart here, a session
  * that this process showed keeps its start, and any other starts at the switch, as classic.SessionStart starts it.
  * Until then the view is the safe one that session.end set: every running job, the wakeup, and no job that ended before
  * the switch. Each call writes the view, because a write that landed before the engine reset `$.state` is gone. With a
@@ -405,8 +405,9 @@ async function switched($: EngineInterface, deadline: Deadline): Promise<void> {
  * of the session id was under way, returns before that write lands. The command.run hook for every command and the
  * config.set hook call this after switched, because a command or a change of an option can reload the mod, and the
  * reload must find the new session's view in `$.state`. With no settle in progress, it waits for nothing and asks
- * nothing. A failed write is no failure of the hook: the hook goes on, and the next tick writes the mirror again (see
- * refresh).
+ * nothing. A failed write is no failure of the hook here. When the last mirror write failed, a settle's write or any
+ * other, both hooks then write the view once more, within the same deadline (see persisted): a reload that comes
+ * before the next tick still finds the view. With no write behind, they write nothing.
  */
 async function settleLanded($: EngineInterface, deadline: Deadline): Promise<void> {
   const write = mirror.settle
@@ -810,24 +811,28 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', async ($, e, next) => {
-    // Every slash command settles a pending switch before it runs, and waits for the write of a settle that is under
-    // way, then runs as typed. A command can reload the mod, such as /reload-plugins: the reload empties memory, and the
-    // engine reset $.state at the switch, so the view must be in $.state first (see switched and settleLanded). With no
-    // switch pending and no settle in progress, this hook asks nothing and waits for nothing.
+    // Every slash command settles a pending switch before it runs, waits for the write of a settle that is under way,
+    // and writes the view once more when the last mirror write failed, then runs as typed. A command can reload the mod,
+    // such as /reload-plugins: the reload empties memory, and the engine reset $.state at the switch, so the view must be
+    // in $.state first (see switched and settleLanded). With no switch pending, no settle in progress, and no write
+    // behind, this hook asks nothing and waits for nothing.
     const deadline = deadlineOf()
     await switched($, deadline)
     await settleLanded($, deadline)
+    if (mirror.isBehind) await persisted($, deadline)
     return next(e)
   }).catch(($, e, next) => passOn($, 'command.run', e, next))
 
   on('config.set', async ($, e, next) => {
-    // Every /config change settles a pending switch before the row changes, and waits for the write of a settle that
-    // is under way, then changes the row as asked. A change of a Downrange option reloads the mod, and no slash command
-    // runs then, so the view must be in $.state first (see switched and settleLanded). This hook never refuses a change
-    // and never changes a value. With no switch pending and no settle in progress, it asks nothing and waits for nothing.
+    // Every /config change settles a pending switch before the row changes, waits for the write of a settle that is
+    // under way, and writes the view once more when the last mirror write failed, then changes the row as asked. A change
+    // of a Downrange option reloads the mod, and no slash command runs then, so the view must be in $.state first (see
+    // switched and settleLanded). This hook never refuses a change and never changes a value. With no switch pending, no
+    // settle in progress, and no write behind, it asks nothing and waits for nothing.
     const deadline = deadlineOf()
     await switched($, deadline)
     await settleLanded($, deadline)
+    if (mirror.isBehind) await persisted($, deadline)
     return next(e)
   }).catch(($, e, next) => passOn($, 'config.set', e, next))
 
