@@ -584,7 +584,7 @@ async function refresh($: EngineInterface, now: number): Promise<void> {
   for (const job of readsDue(seen.jobs.items, now)) await readTail($, deadline, job, now)
   if (mirror.isBehind) await mirrored($, deadline)
   // Every change replaces the jobs or the wakeup: after a change during this tick, the next tick judges liveness on fresh data.
-  if (!isLive(shown, wakeup, now) && memory.jobs === seen.jobs && memory.wakeup === seen.wakeup && !mirror.isBehind) {
+  if (!isLive(shown, wakeup, now) && memory.jobs === seen.jobs && memory.wakeup === seen.wakeup && mirror.writing === null && !mirror.isBehind) {
     ticker?.cancel()
     ticker = null
   }
