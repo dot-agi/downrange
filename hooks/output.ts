@@ -24,8 +24,8 @@ const CLOSER_AFTER = /\s*([\])])/y
 const OUTPUT_PATH = /^(?:[A-Za-z]:)?[\\/][^\n]*[\\/]tasks[\\/]([A-Za-z0-9_-]+)\.output$/
 /** The engine's words before the path in a background command's result. */
 const OUTPUT_NOTICE = 'Output is being written to: '
-/** The line the engine adds to a shell's output when the command ends. */
-const EXIT_LINE = /^\[exited with code -?\d+\]$/
+/** The line the engine adds to a shell's output when the command ends, with the command's exit code. */
+const EXIT_LINE = /^\[exited with code (-?\d+)\]$/
 /** That line at the end of an output's text, with the line break the engine writes before it and the one after it. */
 const EXIT_END = /\n?\[exited with code -?\d+\]\n?$/
 /** A carriage return, built from its code so that no string literal holds a control character. */
@@ -172,6 +172,12 @@ export function outputFileOf(text: string, id: string): string | undefined {
     notice = notice === 0 ? -1 : text.lastIndexOf(OUTPUT_NOTICE, notice - 1)
   }
   return undefined
+}
+
+/** The exit code on the engine's closing `[exited with code N]` line, when the lines of an output end with it: the command ended. */
+export function closingCodeOf(lines: readonly string[]): number | undefined {
+  const code = EXIT_LINE.exec(lines.at(-1) ?? '')?.[1]
+  return code === undefined ? undefined : Number(code)
 }
 
 /** The lines of an output without the engine's closing `[exited with code N]` line: the lines the job wrote. */

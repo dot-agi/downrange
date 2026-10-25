@@ -11,6 +11,7 @@ import {
   activityStarted,
   agentJob,
   agentsSynced,
+  closedRuns,
   finalIdsOf,
   finishedCleared,
   finishedRuns,
@@ -41,7 +42,7 @@ import {
 import type { HistoryRun, JobObservation, SnapshotTask, TailRead } from './jobs'
 import { FS_READ_MAX, MAX_SESSIONS, MIRROR_WAIT_MS, REPEAT_WINDOW_MS, TAIL_TIMEOUT_MS, TICK_MS, TICKER_STALE_MS } from './limits'
 import { noticesOf } from './notices'
-import { displayLinesOf, isOutputFileOf, jobBytesOf, jobLinesOf, oneLine, outputEndOf, outputFileOf } from './output'
+import { closingCodeOf, displayLinesOf, isOutputFileOf, jobBytesOf, jobLinesOf, oneLine, outputEndOf, outputFileOf } from './output'
 import { jobsStateOf, wakeupStateOf } from './state'
 import { isStatusPrompt, normalizePrompt } from './prompt'
 import { redirectFileOf, redirectTargetOf } from './redirect'
@@ -93,11 +94,17 @@ const sessions = new Map<string, number>()
 /** When the last /clear, /resume, or /branch ended a session. */
 let switchedAt: number | null = null
 /**
- * The mirror: the read of it into memory at a load of the module (see loaded), the write under way, the one after it,
- * which holds every change made meanwhile, and whether the last write failed.
+ * The /clear, /resume, or /branch that session.end began, until the mod knows the new session: the end's reason and the
+ * session that ended. classic.SessionStart settles it; where no classic.* event reaches the mod, switched does.
  */
-const mirror: { load: Promise<void> | null; isLoaded: boolean; writing: Write | null; next: Write | null; isBehind: boolean } =
-  { load: null, isLoaded: false, writing: null, next: null, isBehind: false }
+let pending: { reason: 'clear' | 'resume'; ended: string } | null = null
+/**
+ * The mirror: the read of it into memory at a load of the module (see loaded), the write under way, the one after it,
+ * which holds every change made meanwhile, whether the last write failed, and the write that carries the latest settle
+ * of a switch, until that write lands or fails (see settleLanded).
+ */
+const mirror: { load: Promise<void> | null; isLoaded: boolean; writing: Write | null; next: Write | null; isBehind: boolean; settle: Write | null } =
+  { load: null, isLoaded: false, writing: null, next: null, isBehind: false, settle: null }
 /**
  * The last history record; each record waits for it, so two in one session never overwrite each other. Two sessions
  * can still race, because the store has no versioned write; a lost record costs every run it held, a new key's first too.
@@ -117,9 +124,9 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-/** A stat, read, or tail of a job's redirect file that failed, with that failure. */
+/** A stat, read, or tail of a job's redirect file that failed, with that failure, and the code on the closing line of the output file read before it. */
 class RedirectFailure extends Error {
-  constructor(readonly failure: unknown) {
+  constructor(readonly failure: unknown, readonly exitCode: number | undefined) {
     super(messageOf(failure))
   }
 }
@@ -190,11 +197,11 @@ async function writeMirror($: EngineInterface): Promise<void> {
  * after it, which holds every change made meanwhile, begins with its own waiters. A failed write leaves the mirror
  * behind until a later write lands (see refresh).
  */
-function begun($: EngineInterface, waiters: Set<Waiter> = new Set()): Write {
-  const write: Write = { waiters }
+function begun($: EngineInterface, write: Write = { waiters: new Set() }): Write {
   mirror.writing = write
   const ended = (failure: { error: unknown } | null): void => {
     mirror.writing = null
+    if (mirror.settle === write) mirror.settle = null
     mirror.isBehind = failure !== null
     for (const waiter of write.waiters) {
       if (failure === null) waiter.landed()
@@ -204,7 +211,7 @@ function begun($: EngineInterface, waiters: Set<Waiter> = new Set()): Write {
     const next = mirror.next
     if (next !== null) {
       mirror.next = null
-      begun($, next.waiters)
+      begun($, next)
     }
   }
   writeMirror($).then(() => ended(null), (error: unknown) => ended({ error }))
@@ -262,21 +269,24 @@ function waited($: EngineInterface, write: Write, deadline: Deadline): Promise<v
  * began: a write that began before a switch lands before the write that classic.SessionStart asks for. A change while a
  * write runs asks for one more write after it, which holds every change made meanwhile: a burst costs at most two
  * writes, and the last write holds the current data. The hook's deadline bounds the wait (see waited): past it, the
- * change stays in memory, and a later write or tick writes it.
+ * change stays in memory, and a later write or tick writes it. The write of a settle of a switch stays in
+ * `mirror.settle` until it lands or fails, past the deadline too (see settleLanded).
  */
-async function mirrored($: EngineInterface, deadline: Deadline): Promise<void> {
+async function mirrored($: EngineInterface, deadline: Deadline, isSettle = false): Promise<void> {
   if (!mirror.isLoaded) await loaded($)
-  await waited($, carrying($), deadline)
+  const write = carrying($)
+  if (isSettle) mirror.settle = write
+  await waited($, write, deadline)
 }
 
 /**
- * Mirrors a change that memory took (see mirrored). A failed write is no failure of the hook: memory holds the change,
- * so what follows it in the hook still runs, the ticker writes the mirror again, and the failure reports to the
- * transcript the first time, then to the debug log.
+ * Mirrors a change that memory took (see mirrored); `isSettle` marks the view that a settle of a switch gave. A failed
+ * write is no failure of the hook: memory holds the change, so what follows it in the hook still runs, the ticker
+ * writes the mirror again, and the failure reports to the transcript the first time, then to the debug log.
  */
-async function persisted($: EngineInterface, deadline: Deadline): Promise<void> {
+async function persisted($: EngineInterface, deadline: Deadline, isSettle = false): Promise<void> {
   try {
-    await mirrored($, deadline)
+    await mirrored($, deadline, isSettle)
   } catch (error) {
     const isFirst = !reported.has('mirror')
     reported.add('mirror')
@@ -358,6 +368,67 @@ async function seeded($: EngineInterface): Promise<void> {
   if (isReloaded || isJobsOld || isWakeupOld) carrying($)
 }
 
+/**
+ * Settles a /clear, /resume, or /branch that no classic.SessionStart settled yet. Under managed settings or a Team or
+ * Enterprise login, Claude Code's built-in guard keeps every classic.* event from the mod, and session.start does not
+ * fire again. So each hook other than session.start, session.end, classic.SessionStart, and the render hooks calls this
+ * first, and so does each tick. A zero-delay timer that session.end starts calls it once at once, before the first tick
+ * (see settledAtOnce). A command.run hook for every command calls it before the command runs, and a config.set hook for
+ * every key before the row changes, so that a reload of the mod that a command, such as /reload-plugins, or a change of
+ * an option causes finds the view in `$.state`. Both then wait for the write of a settle that is under way, and write
+ * the view once more when the last write failed (see settleLanded). Once `$.session.id()` answers an id other than the
+ * ended session's, that id is the new session, once. After a /clear it starts at the switch. After a /resume or a /branch, which the mod cannot tell apart here, a session
+ * that this process showed keeps its start, and any other starts at the switch, as classic.SessionStart starts it.
+ * Until then the view is the safe one that session.end set: every running job, the wakeup, and no job that ended before
+ * the switch. Each call writes the view, because a write that landed before the engine reset `$.state` is gone. With a
+ * personal login, `$.session.id()` still answers the parent during and before classic.SessionStart on /branch, so no
+ * call settles a branch before that event does.
+ */
+async function switched($: EngineInterface, deadline: Deadline): Promise<void> {
+  const switching = pending
+  if (switching === null) return
+  const id = await $.session.id().catch(() => undefined)
+  // classic.SessionStart, another hook, or a newer switch came meanwhile.
+  if (pending !== switching) return
+  const isSettled = id !== undefined && id !== switching.ended
+  if (isSettled) {
+    pending = null
+    entered(id, (switching.reason === 'resume' ? sessions.get(id) : undefined) ?? switchedAt ?? since)
+  }
+  await persisted($, deadline, isSettled)
+  await ensureTicker($)
+}
+
+/**
+ * Waits until the write that carries the latest settle of a switch lands, until the hook's deadline at most (see
+ * waited). A settle clears `pending` before its write lands, so a call of switched that comes meanwhile, or whose read
+ * of the session id was under way, returns before that write lands. The command.run hook for every command and the
+ * config.set hook call this after switched, because a command or a change of an option can reload the mod, and the
+ * reload must find the new session's view in `$.state`. With no settle in progress, it waits for nothing and asks
+ * nothing. A failed write is no failure of the hook here. When the last mirror write failed, a settle's write or any
+ * other, both hooks then write the view once more, within the same deadline (see persisted): a reload that comes
+ * before the next tick still finds the view. With no write behind, they write nothing.
+ */
+async function settleLanded($: EngineInterface, deadline: Deadline): Promise<void> {
+  const write = mirror.settle
+  if (write === null) return
+  await waited($, write, deadline).catch(() => undefined)
+}
+
+/**
+ * The settle that session.end asks for at once, on a zero-delay timer, because the first tick can be a second away
+ * (see switched). When the engine reset `$.state` before the timer fires, a reload that no event comes before, such as
+ * one after an edit of a settings file, finds the view there. When it resets `$.state` after that, and the switch still
+ * waits, the next tick at the latest writes the view again. A failure logs once per message, as a tick's does.
+ */
+async function settledAtOnce($: EngineInterface): Promise<void> {
+  try {
+    await switched($, deadlineOf())
+  } catch (error) {
+    report($, 'clock.after', messageOf(error), `after|${messageOf(error)}`)
+  }
+}
+
 /** Makes session `id` the current one from `at` on, and keeps the MAX_SESSIONS most recent sessions. */
 function entered(id: string | undefined, at: number): void {
   since = at
@@ -405,7 +476,7 @@ async function redirectFor($: EngineInterface, id: string, command: string, agen
 }
 
 /** Appends clean runs to the duration history, one record at a time; a failure costs the record only and logs once. */
-async function recordRuns($: EngineInterface, runs: readonly HistoryRun[], now: number, event: 'prompt.submit' | 'session.append'): Promise<void> {
+async function recordRuns($: EngineInterface, runs: readonly HistoryRun[], now: number, event: 'prompt.submit' | 'session.append' | 'clock.every'): Promise<void> {
   if (runs.length === 0) return
   const record = historyWrites.then(async () => {
     try {
@@ -476,12 +547,16 @@ async function endOf($: EngineInterface, path: string, size: number): Promise<st
   return outputEndOf(isTail ? await tailOf($, path, size) : await $.fs.read(path), isTail)
 }
 
-/** What a job's output holds now: no new lines while its size stays, else its end. A job with a redirect file also looks at that file (see redirectRead). */
+/**
+ * What a job's output holds now: no new lines while its size stays, else its end, and the exit code when that end is
+ * Claude Code's closing line. A job with a redirect file also looks at that file (see redirectRead).
+ */
 async function readOutput($: EngineInterface, job: ShellJob & { outputFile: string }): Promise<TailRead> {
   const stat = await $.fs.stat(job.outputFile)
   const isAsked = job.failedReadBytes !== undefined || job.finalReadAskedAt !== undefined
   const text = stat.size === job.outputBytes && !isAsked ? undefined : await endOf($, job.outputFile, stat.size)
-  const output: TailRead = { bytes: stat.size, mtimeMs: stat.mtimeMs, lines: text === undefined ? [] : displayLinesOf(text) }
+  const lines = text === undefined ? [] : displayLinesOf(text)
+  const output: TailRead = { bytes: stat.size, mtimeMs: stat.mtimeMs, lines, exitCode: closingCodeOf(lines) }
   return job.redirectFile === undefined ? output : await redirectRead($, job, job.redirectFile, output, text, isAsked)
 }
 
@@ -493,7 +568,7 @@ async function readOutput($: EngineInterface, job: ShellJob & { outputFile: stri
  * the row shows from it, and it does not count while the row shows the redirect file. When the redirect file is missing
  * or not a regular file, the output file shows if it holds a job line. The redirect file is read again when its size or
  * its modification time changes. A read of it carries its size and time, which tailRead keeps as redirectBytes and
- * lastOutputAt.
+ * lastOutputAt. Every result, and a failure, carries the exit code on the closing line of the output file.
  */
 async function redirectRead($: EngineInterface, job: ShellJob & { outputFile: string }, redirectFile: string, output: TailRead, text: string | undefined, isAsked: boolean): Promise<TailRead> {
   const isRedirectShown = job.redirectBytes !== undefined
@@ -509,20 +584,33 @@ async function redirectRead($: EngineInterface, job: ShellJob & { outputFile: st
   } catch (error) {
     // A row that shows the redirect file needs the output file's end to show it instead.
     const lines = text === undefined && isRedirectShown ? displayLinesOf(await endOf($, job.outputFile, output.bytes)) : output.lines
-    if (hasJobLine(lines)) return { ...output, lines }
-    throw new RedirectFailure(error)
+    if (hasJobLine(lines)) return { ...output, lines, exitCode: closingCodeOf(lines) }
+    throw new RedirectFailure(error, closingCodeOf(lines))
   }
   if (outputAt !== undefined && outputAt >= redirect.mtimeMs && hasJobLine(output.lines)) return output
   try {
     const isSame = isRedirectShown && redirect.size === job.redirectBytes && redirect.mtimeMs === job.lastOutputAt
     const lines = isSame && !isAsked ? [] : displayLinesOf(await endOf($, redirectFile, redirect.size))
-    return { bytes: output.bytes, mtimeMs: redirect.mtimeMs, lines, redirectBytes: redirect.size }
+    return { bytes: output.bytes, mtimeMs: redirect.mtimeMs, lines, redirectBytes: redirect.size, exitCode: output.exitCode }
   } catch (error) {
-    throw new RedirectFailure(error)
+    throw new RedirectFailure(error, output.exitCode)
   }
 }
 
-/** Reads one shell job's output and applies it; only a failed stat, read, or tail sets the job's note and logs once per job and file. */
+/** Applies a read of a job's output, or a failed read, and records the clean run that the read's closing line ends (see closedRuns). */
+async function readApplied($: EngineInterface, deadline: Deadline, id: string, now: number, exitCode: number | undefined, change: (jobs: Job[]) => Job[]): Promise<void> {
+  let runs: HistoryRun[] = []
+  const changed = await writeJobs($, deadline, { at: now, ids: [id] }, jobs => {
+    runs = closedRuns(jobs, id, exitCode, now)
+    return change(jobs)
+  })
+  if (changed) await recordRuns($, runs, now, 'clock.every')
+}
+
+/**
+ * Reads one shell job's output and applies it; only a failed stat, read, or tail sets the job's note and logs once per
+ * job and file. An output file that ends with Claude Code's closing line ends a running row with its exit code.
+ */
 async function readTail($: EngineInterface, deadline: Deadline, job: ShellJob & { outputFile: string }, now: number): Promise<void> {
   const path = job.outputFile
   if (!isOutputFileOf(path, job.id)) {
@@ -539,10 +627,11 @@ async function readTail($: EngineInterface, deadline: Deadline, job: ShellJob & 
     const bytes = failure instanceof TailFailure ? failure.bytes : undefined
     const verb = bytes === undefined ? 'read' : 'tail'
     report($, 'clock.every', `cannot ${verb} ${isRedirect ? 'the redirect file' : 'the output'} of task ${job.id}: ${messageOf(failure)}`, `${isRedirect ? 'redirect ' : ''}${verb}|${job.id}`)
-    await writeJobs($, deadline, { at: now, ids: [job.id] }, jobs => readFailed(jobs, job.id, bytes === undefined ? 'output unavailable' : 'tail failed', now, bytes))
+    const exitCode = isRedirect ? error.exitCode : undefined
+    await readApplied($, deadline, job.id, now, exitCode, jobs => readFailed(jobs, job.id, bytes === undefined ? 'output unavailable' : 'tail failed', now, bytes, exitCode))
     return
   }
-  await writeJobs($, deadline, { at: now, ids: [job.id] }, jobs => tailRead(jobs, job.id, found, now, isAnyRatio))
+  await readApplied($, deadline, job.id, now, found.exitCode, jobs => tailRead(jobs, job.id, found, now, isAnyRatio))
 }
 
 /** Applies `$.agent.list()` to agent jobs; a failed list logs once. */
@@ -572,11 +661,12 @@ async function tick($: EngineInterface): Promise<void> {
 }
 
 /**
- * The work of one tick: expire the wakeup, sync agents, read outputs (a pending final read too), write a mirror that
- * fell behind, redraw, and stop when nothing is live.
+ * The work of one tick: settle a switch (see switched), expire the wakeup, sync agents, read outputs (a pending final
+ * read too), write a mirror that fell behind, redraw, and stop when nothing is live and no switch waits.
  */
 async function refresh($: EngineInterface, now: number): Promise<void> {
   const deadline = deadlineOf()
+  await switched($, deadline)
   const seen = { ...memory }
   const { jobs: { items: shown }, wakeup: { pending: wakeup } } = viewNow()
   if (wakeupAfterTick(wakeup, now) !== wakeup) await writeWakeup($, deadline, now, current => wakeupAfterTick(current, now))
@@ -584,7 +674,7 @@ async function refresh($: EngineInterface, now: number): Promise<void> {
   for (const job of readsDue(seen.jobs.items, now)) await readTail($, deadline, job, now)
   if (mirror.isBehind) await mirrored($, deadline)
   // Every change replaces the jobs or the wakeup: after a change during this tick, the next tick judges liveness on fresh data.
-  if (!isLive(shown, wakeup, now) && memory.jobs === seen.jobs && memory.wakeup === seen.wakeup && mirror.writing === null && !mirror.isBehind) {
+  if (!isLive(shown, wakeup, now) && memory.jobs === seen.jobs && memory.wakeup === seen.wakeup && mirror.writing === null && !mirror.isBehind && pending === null) {
     ticker?.cancel()
     ticker = null
   }
@@ -680,22 +770,36 @@ export const register: Register = (on, options) => {
 
   on('session.end', async ($, e, next) => {
     // /clear, /resume, and /branch go on in this process: the next session that this process has not shown starts its
-    // Finished here. Memory stays as it is.
-    if (e.reason === 'clear' || e.reason === 'resume') switchedAt = await $.clock.now()
+    // Finished here. Memory stays as it is. Until the mod knows the new session (see switched), the view is a new
+    // session's, which shows no job that ended before the switch, and the ticker runs, so that a tick settles the
+    // switch when no other event comes. A zero-delay timer settles once at once, before the first tick.
+    if (e.reason === 'clear' || e.reason === 'resume') {
+      switchedAt = await $.clock.now()
+      pending = { reason: e.reason, ended: e.sessionId }
+      since = switchedAt
+      await ensureTicker($)
+      $.clock.after(0, () => {
+        void settledAtOnce($)
+      })
+    }
     return next(e)
   }).catch(($, e, next) => passOn($, 'session.end', e, next))
 
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
     // e.session_id names the session that starts; this hook asks no session id. The engine reset $.state, and the
     // mirror write here puts the new session's view in it. One mirror write runs at a time, so a write that began
-    // before the switch lands first, and the write after it holds the new session's view (see mirrored).
+    // before the switch lands first, and the write after it holds the new session's view (see mirrored). This event
+    // settles the switch, so a command or a /config change waits for its write (see settleLanded). A switch that a hook
+    // settled before it gets the same start here, and memory keeps every change made since (see switched).
+    pending = null
     entered(e.session_id, sessions.get(e.session_id) ?? switchedAt ?? await $.clock.now())
-    await persisted($, deadlineOf())
+    await persisted($, deadlineOf(), true)
     await ensureTicker($)
     return next(e)
   }).catch(($, e, next) => passOn($, 'classic.SessionStart{source=clear|resume|fork}', e, next))
 
   on('command.run', { command: COMMAND }, async ($, e) => {
+    await switched($, deadlineOf())
     const argument = e.args.trim()
     if (argument === '') return { text: await tableNow($, e.presentation.columns) }
     if (argument === 'pane') return togglePane($, e.presentation.columns)
@@ -706,7 +810,35 @@ export const register: Register = (on, options) => {
     return { text: `/downrange could not run: ${failureText(next.error)}.` }
   })
 
+  on('command.run', async ($, e, next) => {
+    // Every slash command settles a pending switch before it runs, waits for the write of a settle that is under way,
+    // and writes the view once more when the last mirror write failed, then runs as typed. A command can reload the mod,
+    // such as /reload-plugins: the reload empties memory, and the engine reset $.state at the switch, so the view must be
+    // in $.state first (see switched and settleLanded). With no switch pending, no settle in progress, and no write
+    // behind, this hook asks nothing and waits for nothing.
+    const deadline = deadlineOf()
+    await switched($, deadline)
+    await settleLanded($, deadline)
+    if (mirror.isBehind) await persisted($, deadline)
+    return next(e)
+  }).catch(($, e, next) => passOn($, 'command.run', e, next))
+
+  on('config.set', async ($, e, next) => {
+    // Every /config change settles a pending switch before the row changes, waits for the write of a settle that is
+    // under way, and writes the view once more when the last mirror write failed, then changes the row as asked. A change
+    // of a Downrange option reloads the mod, and no slash command runs then, so the view must be in $.state first (see
+    // switched and settleLanded). This hook never refuses a change and never changes a value. With no switch pending, no
+    // settle in progress, and no write behind, it asks nothing and waits for nothing.
+    const deadline = deadlineOf()
+    await switched($, deadline)
+    await settleLanded($, deadline)
+    if (mirror.isBehind) await persisted($, deadline)
+    return next(e)
+  }).catch(($, e, next) => passOn($, 'config.set', e, next))
+
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const deadline = deadlineOf()
+    await switched($, deadline)
     const ran = await next(e)
     if (ran.deny !== undefined || ran.isError === true) return ran
     const id = ran.result.backgroundTaskId
@@ -718,7 +850,6 @@ export const register: Register = (on, options) => {
     }
     const note = shellLaunchNote(ran.result, outputFile !== undefined)
     const redirectFile = await redirectFor($, id, e.command, e.agentId)
-    const deadline = deadlineOf()
     await writeJobs($, deadline, { at: now, ids: [id] }, jobs => launched(jobs, shellJob({ id, command: e.command, description: e.description, outputFile, redirectFile, note, ownerAgentId: e.agentId, endsWithAgent: ran.result.backgroundEndsWithFinalResponse === true }, now)))
     // The history read comes after the launch, so an end or a clear that comes meanwhile is never undone.
     const history = await historyFor($, e.command)
@@ -727,15 +858,19 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => passOn($, 'tool.call{tool=Bash}', e, next))
 
   on('tool.call', { tool: 'Monitor' }, async ($, e, next) => {
+    const deadline = deadlineOf()
+    await switched($, deadline)
     const ran = await next(e)
     if (ran.deny !== undefined || ran.isError === true) return ran
     const now = await $.clock.now()
     const job = monitorJob({ id: ran.result.taskId, description: e.description, timeoutMs: ran.result.timeoutMs, isPersistent: ran.result.persistent === true }, now)
-    await writeJobs($, deadlineOf(), { at: now, ids: [job.id] }, jobs => launched(jobs, job))
+    await writeJobs($, deadline, { at: now, ids: [job.id] }, jobs => launched(jobs, job))
     return ran
   }).catch(($, e, next) => passOn($, 'tool.call{tool=Monitor}', e, next))
 
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
+    const deadline = deadlineOf()
+    await switched($, deadline)
     const ran = await next(e)
     if (ran.deny !== undefined || ran.isError === true) return ran
     // A foreground call answers `completed`, and a plugin's own call an AgentCallRecord (no status) once the agent settled: nothing runs.
@@ -750,45 +885,52 @@ export const register: Register = (on, options) => {
         : result.status === 'async_launched'
           ? agentJob({ id: result.agentId, description: result.description }, now)
           : agentJob({ id: result.taskId, description: result.description, note: 'remote', runsElsewhere: true }, now)
-    await writeJobs($, deadlineOf(), { at: now, ids: [job.id] }, jobs => launched(jobs, job))
+    await writeJobs($, deadline, { at: now, ids: [job.id] }, jobs => launched(jobs, job))
     return ran
   }).catch(($, e, next) => passOn($, 'tool.call{tool=Agent}', e, next))
 
   on('tool.call', { tool: 'Workflow' }, async ($, e, next) => {
+    const deadline = deadlineOf()
+    await switched($, deadline)
     const ran = await next(e)
     if (ran.deny !== undefined || ran.isError === true || ran.result.error !== undefined) return ran
     const now = await $.clock.now()
     const job = workflowJob({ id: ran.result.taskId, name: ran.result.workflowName }, now)
-    await writeJobs($, deadlineOf(), { at: now, ids: [job.id] }, jobs => launched(jobs, job))
+    await writeJobs($, deadline, { at: now, ids: [job.id] }, jobs => launched(jobs, job))
     return ran
   }).catch(($, e, next) => passOn($, 'tool.call{tool=Workflow}', e, next))
 
   on('tool.call', { tool: 'ScheduleWakeup' }, async ($, e, next) => {
+    const deadline = deadlineOf()
+    await switched($, deadline)
     const ran = await next(e)
     if (ran.deny !== undefined || ran.isError === true) return ran
     const now = await $.clock.now()
     const wakeup = ran.result.stopped === true ? null : wakeupOf(ran.result.scheduledFor, e.reason, now)
-    await writeWakeup($, deadlineOf(), now, () => wakeup, true)
+    await writeWakeup($, deadline, now, () => wakeup, true)
     return ran
   }).catch(($, e, next) => passOn($, 'tool.call{tool=ScheduleWakeup}', e, next))
 
   on('tool.call', { tool: 'TaskStop' }, async ($, e, next) => {
+    const deadline = deadlineOf()
+    await switched($, deadline)
     const ran = await next(e)
     if (ran.deny !== undefined || ran.isError === true) return ran
     const now = await $.clock.now()
     const id = ran.result.task_id
-    await writeJobs($, deadlineOf(), { at: now, ids: [id] }, jobs => stoppedJob(jobs, id, now))
+    await writeJobs($, deadline, { at: now, ids: [id] }, jobs => stoppedJob(jobs, id, now))
     return ran
   }).catch(($, e, next) => passOn($, 'tool.call{tool=TaskStop}', e, next))
 
   on('tool.call', async ($, e, next) => {
+    const deadline = deadlineOf()
+    await switched($, deadline)
     const agentId = e.agentId
     if (agentId === undefined) return next(e)
     if (!mirror.isLoaded) await loaded($)
     if (!memory.jobs.items.some(job => job.kind === 'agent' && job.id === agentId)) return next(e)
     const started = await $.clock.now()
     const summary = activityOf(String(e.tool), e)
-    const deadline = deadlineOf()
     await writeJobs($, deadline, { at: started, ids: [agentId], kind: 'activity' }, jobs => activityStarted(jobs, agentId, summary, started))
     // A call that rejects counts as failed; the in-flight count drops whatever happens.
     let isFailure = true
@@ -803,35 +945,40 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => passOn($, 'tool.call', e, next))
 
   on('session.append', async ($, e, next) => {
+    const deadline = deadlineOf()
+    await switched($, deadline)
     if (e.agentId === undefined || e.origin.kind !== 'task-notification') return next(e)
     const now = await $.clock.now()
     const stored = await next(e)
     if (stored.deny !== undefined || stored.uuid !== e.uuid) return stored
     const text = stored.message.content.flatMap(block => block.type === 'text' && 'text' in block && typeof block.text === 'string' ? [block.text] : []).join('\n')
-    await applyNotices($, deadlineOf(), text, JSON.stringify([e.agentId, stored.uuid]), now)
+    await applyNotices($, deadline, text, JSON.stringify([e.agentId, stored.uuid]), now)
     return stored
   }).catch(($, e, next) => passOn($, 'session.append', e, next))
 
   on('turn.complete', async ($, e, next) => {
+    const deadline = deadlineOf()
+    await switched($, deadline)
     const now = await $.clock.now()
     const result = await next(e)
-    if (e.agentId !== undefined) {
-      const deadline = deadlineOf()
-      if (e.reason === 'answer' && !e.isAborted) {
-        const agentId = e.agentId
-        await writeJobs($, deadline, { at: now }, jobs => ownerAnswered(jobs, agentId, now))
-      }
-      await syncAgents($, deadline, await $.clock.now(), 'turn.complete')
-    }
+    const agentId = e.agentId
+    if (agentId !== undefined && e.reason === 'answer' && !e.isAborted) await writeJobs($, deadline, { at: now }, jobs => ownerAnswered(jobs, agentId, now))
+    // A subagent's turn end reads the agent list. A main-loop turn end runs the agent sync of classic.Stop and
+    // classic.SubagentStop too: under managed settings or a Team or Enterprise login, those events do not reach the
+    // mod. Where they do, both syncs read the same list, and the ordering rule keeps the newer reading.
+    if (agentId !== undefined || memory.jobs.items.some(job => job.kind === 'agent')) await syncAgents($, deadline, await $.clock.now(), 'turn.complete')
     return result
   }).catch(($, e, next) => passOn($, 'turn.complete', e, next))
 
   on('prompt.submit', async ($, e, next) => {
+    // The status answer reads the view, so a switch settles before it.
+    const deadline = deadlineOf()
+    await switched($, deadline)
     if (e.origin.kind === 'task-notification') {
-      await applyNotices($, deadlineOf(), e.text)
+      await applyNotices($, deadline, e.text)
     } else if (e.origin.kind === 'scheduled-trigger') {
       const now = await $.clock.now()
-      await writeWakeup($, deadlineOf(), now, wakeup => wakeupAfterTrigger(wakeup, now))
+      await writeWakeup($, deadline, now, wakeup => wakeupAfterTrigger(wakeup, now))
     } else if (options.answerStatusPrompts === true && e.origin.kind === 'composer' && e.turnId === undefined && e.attachments === undefined) {
       const answer = await statusAnswer($, e.text)
       if (answer !== undefined) return { drop: answer }
@@ -841,6 +988,7 @@ export const register: Register = (on, options) => {
 
   on('classic.Stop', async ($, e, next) => {
     const deadline = deadlineOf()
+    await switched($, deadline)
     await reconcile($, deadline, 'classic.Stop', e)
     if (memory.jobs.items.some(job => job.kind === 'agent')) await syncAgents($, deadline, await $.clock.now(), 'classic.Stop')
     return next(e)
@@ -848,6 +996,7 @@ export const register: Register = (on, options) => {
 
   on('classic.SubagentStop', async ($, e, next) => {
     const deadline = deadlineOf()
+    await switched($, deadline)
     await reconcile($, deadline, 'classic.SubagentStop', e)
     if (memory.jobs.items.some(job => job.kind === 'agent')) await syncAgents($, deadline, await $.clock.now(), 'classic.SubagentStop')
     return next(e)
