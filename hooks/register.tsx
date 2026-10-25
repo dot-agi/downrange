@@ -26,12 +26,12 @@ import {
   readsDue,
   reconciled,
   reloaded,
-  restoredJobs,
   shellJob,
   ownerAnswered,
   shellLaunchNote,
   stoppedJob,
   tailRead,
+  viewedJobs,
   wakeupAfterSnapshot,
   wakeupAfterTick,
   wakeupAfterTrigger,
@@ -39,7 +39,7 @@ import {
   workflowJob,
 } from './jobs'
 import type { HistoryRun, JobObservation, SnapshotTask, TailRead } from './jobs'
-import { CARRY_ATTEMPTS, STATE_WRITE_ATTEMPTS, FS_READ_MAX, REPEAT_WINDOW_MS, TAIL_TIMEOUT_MS, TICK_MS, TICKER_STALE_MS } from './limits'
+import { FS_READ_MAX, MAX_SESSIONS, MIRROR_WAIT_MS, REPEAT_WINDOW_MS, TAIL_TIMEOUT_MS, TICK_MS, TICKER_STALE_MS } from './limits'
 import { noticesOf } from './notices'
 import { displayLinesOf, isOutputFileOf, jobBytesOf, jobLinesOf, oneLine, outputEndOf, outputFileOf } from './output'
 import { jobsStateOf, wakeupStateOf } from './state'
@@ -61,10 +61,15 @@ const LAST_ANSWERED = atom({ plugin: 'downrange', key: 'lastAnswered' } as const
 
 /** The buttons of the band and the pane. */
 type Control = 'Open' | 'Hide' | 'Clear finished' | 'Close'
+/** A hook that waits for a mirror write: told when the write lands, or why it failed. */
+type Waiter = { landed: () => void; failed: (error: unknown) => void }
+/** A mirror write, under way or next in line, and the hooks that wait for it. */
+type Write = { waiters: Set<Waiter> }
+/** One hook's bound on its waits for the mirror: its timer, whether it passed, and how each wait leaves at it. */
+type Deadline = { timer: Timer | null; isPassed: boolean; leaves: Set<() => void> }
 
-/** Running jobs and the wakeup, as the carry across /clear, /resume, and /branch holds them. */
-type Carry = { jobs: JobsState; wakeup: WakeupState; destination?: string; attempts: number; restoring: boolean }
-type Committed = { jobs: JobsState; wakeup: WakeupState; sessionId?: string; jobsVersion: number; wakeupVersion: number }
+const NO_JOBS: JobsState = { items: [], observed: [], removed: [], snapshotAt: null }
+const NO_WAKEUP: WakeupState = { pending: null, updatedAt: null }
 
 /** Keys of diagnostics already shown; a reload re-arms them on purpose. */
 const reported = new Set<string>()
@@ -75,10 +80,24 @@ let ticker: Timer | null = null
 let isTicking = false
 /** When the ticker last ran a period, or started; an old time means a refused period ended it. */
 let lastTickAt = 0
-/** The newest committed state and versions; session.end saves running rows and ordering barriers. */
-let latest: Committed = { jobsVersion: -1, wakeupVersion: -1, jobs: { items: [], observed: [], removed: [], snapshotAt: null }, wakeup: { pending: null, updatedAt: null } }
-/** What session.end saved for the next classic.SessionStart. */
-let carry: Carry | null = null
+/**
+ * The process's jobs and wakeup, the source of truth. Background work belongs to the process, so every session of the
+ * process shows it, and /clear, /resume, and /branch do not touch it. Each hook changes it at once; `$.state` holds a
+ * mirror of the current session's view of it, for drawing (see mirrored).
+ */
+const memory: { jobs: JobsState; wakeup: WakeupState } = { jobs: NO_JOBS, wakeup: NO_WAKEUP }
+/** The current session's `since`: its Finished shows the jobs that ended from then on (see viewNow). */
+let since = -Infinity
+/** The `since` of each session that this process showed, by session id: the MAX_SESSIONS most recent, oldest first. */
+const sessions = new Map<string, number>()
+/** When the last /clear, /resume, or /branch ended a session. */
+let switchedAt: number | null = null
+/**
+ * The mirror: the read of it into memory at a load of the module (see loaded), the write under way, the one after it,
+ * which holds every change made meanwhile, and whether the last write failed.
+ */
+const mirror: { load: Promise<void> | null; isLoaded: boolean; writing: Write | null; next: Write | null; isBehind: boolean } =
+  { load: null, isLoaded: false, writing: null, next: null, isBehind: false }
 /**
  * The last history record; each record waits for it, so two in one session never overwrite each other. Two sessions
  * can still race, because the store has no versioned write; a lost record costs every run it held, a new key's first too.
@@ -118,9 +137,14 @@ function reportHook($: EngineInterface, hook: string, failure: HookFailure): voi
   $.ui.log(`${isFirst ? 'downrange: ' : ''}${hook}: ${failureText(failure)}`, { to: isFirst ? 'transcript' : 'debug' })
 }
 
+/** Whether a hook failed by re-entry. Claude Code 2.1.309 and earlier report this kind; the 2.1.310 types no longer name it. */
+function isReentry(failure: HookFailure): boolean {
+  return (failure.kind as string) === 're-entry'
+}
+
 /** What the `.catch` of a hook that only watches does: it reports the failure under the hook's label and passes the event on unchanged. */
 function passOn<I, R>($: EngineInterface, label: string, e: I, next: ((e: I) => R) & Caught): R {
-  if (next.error.kind !== 're-entry') reportHook($, label, next.error)
+  if (!isReentry(next.error)) reportHook($, label, next.error)
   return next(e)
 }
 
@@ -146,82 +170,203 @@ async function ensureTicker($: EngineInterface): Promise<void> {
   })
 }
 
-/** Writes only to the destination captured before the read and retains committed versions alone. */
-async function writeJobs($: EngineInterface, input: JobObservation | JobsState | null, change: (jobs: Job[]) => Job[] = jobs => jobs, destination?: string): Promise<boolean> {
-  const sessionId = destination ?? await $.session.id()
-  for (let attempt = 0; attempt < STATE_WRITE_ATTEMPTS; attempt++) {
-    if (await $.session.id() !== sessionId) throw new Error('jobs destination changed')
-    const raw = await $.state.get({ plugin: 'downrange', key: 'jobs' })
-    const decoded = jobsStateOf(raw.value)
-    if (raw.value !== undefined && decoded === undefined) report($, 'state.get', 'unsupported or invalid jobs state; reset safely', 'jobs-shape')
-    const state = decoded ?? { items: [], observed: [], removed: [], snapshotAt: null }
-    const changed = input === null ? state : 'items' in input ? restoredJobs(state, input) : observedJobs(state, input, change)
-    if (await $.session.id() !== sessionId) throw new Error('jobs destination changed')
-    const written = input === null && (raw.value === undefined || (decoded !== undefined && raw.value.shape === 'v8'))
-      ? { isSet: true, version: raw.version }
-      : await $.state.set({ plugin: 'downrange', key: 'jobs' }, { shape: 'v8', value: changed }, { ifVersion: raw.version })
-    if (!written.isSet) continue
-    if (await $.session.id() !== sessionId) throw new Error('jobs destination changed')
-    if (latest.sessionId !== sessionId) latest = { sessionId, jobs: state, wakeup: { pending: null, updatedAt: null }, jobsVersion: -1, wakeupVersion: -1 }
-    if (written.version > latest.jobsVersion) latest = { ...latest, jobs: changed, jobsVersion: written.version }
-    await ensureTicker($)
-    return changed !== state
-  }
-  throw new Error('jobs state stayed busy')
+/**
+ * The current session's view of the process's data: every running job, the ended jobs from its `since` on with a
+ * removal for each other one (see viewedJobs), and the wakeup.
+ */
+function viewNow(): { jobs: JobsState; wakeup: WakeupState } {
+  return { jobs: viewedJobs(memory.jobs, since), wakeup: memory.wakeup }
 }
 
-/** Migrates before replacement and preserves the latest committed wakeup cancellation. */
-async function writeWakeup($: EngineInterface, now: number, change: (wakeup: Wakeup | null) => Wakeup | null, isReplacement = false, destination?: string): Promise<void> {
-  const sessionId = destination ?? await $.session.id()
-  for (let attempt = 0; attempt < STATE_WRITE_ATTEMPTS; attempt++) {
-    if (await $.session.id() !== sessionId) throw new Error('wakeup destination changed')
-    const raw = await $.state.get({ plugin: 'downrange', key: 'wakeup' })
-    const decoded = wakeupStateOf(raw.value)
-    if (raw.value !== undefined && decoded === undefined) report($, 'state.get', 'unsupported or invalid wakeup state; reset safely', 'wakeup-shape')
-    const state = decoded ?? { pending: null, updatedAt: null }
-    const accepts = state.updatedAt === null || now >= state.updatedAt
-    const pending = accepts ? change(state.pending) : state.pending
-    const changed = accepts && (isReplacement || pending !== state.pending) ? { pending, updatedAt: now } : state
-    if (await $.session.id() !== sessionId) throw new Error('wakeup destination changed')
-    const written = changed === state && (raw.value === undefined || (decoded !== undefined && raw.value.shape === 'v4'))
-      ? { isSet: true, version: raw.version }
-      : await $.state.set({ plugin: 'downrange', key: 'wakeup' }, { shape: 'v4', value: changed }, { ifVersion: raw.version })
-    if (!written.isSet) continue
-    if (await $.session.id() !== sessionId) throw new Error('wakeup destination changed')
-    if (latest.sessionId !== sessionId) latest = { sessionId, jobs: { items: [], observed: [], removed: [], snapshotAt: null }, wakeup: state, jobsVersion: -1, wakeupVersion: -1 }
-    if (written.version > latest.wakeupVersion) latest = { ...latest, wakeup: changed, wakeupVersion: written.version }
-    await ensureTicker($)
-    return
-  }
-  throw new Error('wakeup state stayed busy')
+/** One write of the mirror: the view as it stands when the write begins, the jobs, then the wakeup. */
+async function writeMirror($: EngineInterface): Promise<void> {
+  const shown = viewNow()
+  await $.state.set({ plugin: 'downrange', key: 'jobs' }, { shape: 'v8', value: shown.jobs })
+  await $.state.set({ plugin: 'downrange', key: 'wakeup' }, { shape: 'v4', value: shown.wakeup })
 }
 
-/** Keeps running rows and barriers for every terminal row omitted from the handoff. */
-function carriedJobs(state: JobsState): JobsState {
-  const removed = new Map(state.removed)
-  const observed = new Map(state.observed)
-  for (const job of state.items) {
-    if (!isRunning(job)) removed.set(job.id, Math.max(removed.get(job.id) ?? -Infinity, observed.get(job.id) ?? job.lastEndedAt ?? job.startedAt))
-  }
-  return { ...state, items: state.items.filter(isRunning), removed: [...removed] }
-}
-
-/** Retries a pending handoff only in its assigned destination; both writes must succeed before clearance. */
-async function restoreCarry($: EngineInterface): Promise<void> {
-  const carried = carry
-  if (carried === null || carried.destination === undefined || carried.restoring || carried.attempts >= CARRY_ATTEMPTS) return
-  if (await $.session.id() !== carried.destination || carry !== carried) return
-  carried.restoring = true
-  carried.attempts++
-  try {
-    await writeJobs($, carried.jobs, jobs => jobs, carried.destination)
-    if (carry !== carried || await $.session.id() !== carried.destination) return
-    if (carried.wakeup.updatedAt !== null) {
-      await writeWakeup($, carried.wakeup.updatedAt, () => carried.wakeup.pending, true, carried.destination)
+/**
+ * Begins a mirror write, for the hooks that wait for it. When it ends, one listener tells each of them, and the write
+ * after it, which holds every change made meanwhile, begins with its own waiters. A failed write leaves the mirror
+ * behind until a later write lands (see refresh).
+ */
+function begun($: EngineInterface, waiters: Set<Waiter> = new Set()): Write {
+  const write: Write = { waiters }
+  mirror.writing = write
+  const ended = (failure: { error: unknown } | null): void => {
+    mirror.writing = null
+    mirror.isBehind = failure !== null
+    for (const waiter of write.waiters) {
+      if (failure === null) waiter.landed()
+      else waiter.failed(failure.error)
     }
-    if (carry === carried && await $.session.id() === carried.destination) carry = null
-  } finally {
-    carried.restoring = false
+    write.waiters.clear()
+    const next = mirror.next
+    if (next !== null) {
+      mirror.next = null
+      begun($, next.waiters)
+    }
+  }
+  writeMirror($).then(() => ended(null), (error: unknown) => ended({ error }))
+  return write
+}
+
+/** The write that holds the data as it stands now: a new write when none runs, else the one after the write under way. */
+function carrying($: EngineInterface): Write {
+  if (mirror.next !== null) return mirror.next
+  if (mirror.writing === null) return begun($)
+  mirror.next = { waiters: new Set() }
+  return mirror.next
+}
+
+/** A new bound for one hook's waits for the mirror (see waited). */
+function deadlineOf(): Deadline {
+  return { timer: null, isPassed: false, leaves: new Set() }
+}
+
+/**
+ * Waits until `write` lands, until the hook's deadline at most. The deadline starts at the hook's first wait and holds
+ * for every wait of that hook, so one hook waits MIRROR_WAIT_MS at most in all. At the deadline the hook leaves the
+ * write's waiters, so a write that does not answer keeps nothing of it; the deadline's timer ends by itself then.
+ */
+function waited($: EngineInterface, write: Write, deadline: Deadline): Promise<void> {
+  if (deadline.isPassed) return Promise.resolve()
+  return new Promise<void>((resolve, reject) => {
+    const leave = (): void => {
+      write.waiters.delete(waiter)
+      resolve()
+    }
+    const waiter: Waiter = {
+      landed: () => {
+        deadline.leaves.delete(leave)
+        resolve()
+      },
+      failed: error => {
+        deadline.leaves.delete(leave)
+        reject(error)
+      },
+    }
+    write.waiters.add(waiter)
+    deadline.leaves.add(leave)
+    deadline.timer ??= $.clock.after(MIRROR_WAIT_MS, () => {
+      deadline.isPassed = true
+      for (const left of deadline.leaves) left()
+      deadline.leaves.clear()
+    })
+  })
+}
+
+/**
+ * Writes the current session's view to the mirror after a change, and waits until a write that holds the change has
+ * landed: a reload right after the hook keeps the change. One write runs at a time, so the writes land in the order they
+ * began: a write that began before a switch lands before the write that classic.SessionStart asks for. A change while a
+ * write runs asks for one more write after it, which holds every change made meanwhile: a burst costs at most two
+ * writes, and the last write holds the current data. The hook's deadline bounds the wait (see waited): past it, the
+ * change stays in memory, and a later write or tick writes it.
+ */
+async function mirrored($: EngineInterface, deadline: Deadline): Promise<void> {
+  if (!mirror.isLoaded) await loaded($)
+  await waited($, carrying($), deadline)
+}
+
+/**
+ * Mirrors a change that memory took (see mirrored). A failed write is no failure of the hook: memory holds the change,
+ * so what follows it in the hook still runs, the ticker writes the mirror again, and the failure reports to the
+ * transcript the first time, then to the debug log.
+ */
+async function persisted($: EngineInterface, deadline: Deadline): Promise<void> {
+  try {
+    await mirrored($, deadline)
+  } catch (error) {
+    const isFirst = !reported.has('mirror')
+    reported.add('mirror')
+    $.ui.log(`${isFirst ? 'downrange: ' : ''}state.set: cannot write the copy of the session's view: ${messageOf(error)}; the next tick writes it again`, { to: isFirst ? 'transcript' : 'debug' })
+  }
+}
+
+/**
+ * Applies an observation to the process's jobs by the ordering rule, then mirrors them; the result tells whether they
+ * changed. In a module that has not read the mirror yet, the observation waits for that read (see loaded).
+ */
+async function writeJobs($: EngineInterface, deadline: Deadline, input: JobObservation, change: (jobs: Job[]) => Job[] = jobs => jobs): Promise<boolean> {
+  if (!mirror.isLoaded) await loaded($)
+  const before = memory.jobs
+  memory.jobs = observedJobs(before, input, change)
+  const isChanged = memory.jobs !== before
+  // What follows the change runs whether or not the mirror write lands: the ticker, which reads outputs and writes a
+  // mirror that fell behind, and the rest of the hook.
+  if (isChanged) await persisted($, deadline)
+  await ensureTicker($)
+  return isChanged
+}
+
+/** The wakeup state after a write at `now`: an older write never replaces a newer one. */
+function wakeupWritten(state: WakeupState, now: number, change: (wakeup: Wakeup | null) => Wakeup | null, isReplacement: boolean): WakeupState {
+  if (state.updatedAt !== null && now < state.updatedAt) return state
+  const pending = change(state.pending)
+  return isReplacement || pending !== state.pending ? { pending, updatedAt: now } : state
+}
+
+/** Sets the process's wakeup, and preserves the latest wakeup cancellation, then mirrors it; it waits, reports, and starts the ticker as writeJobs does. */
+async function writeWakeup($: EngineInterface, deadline: Deadline, now: number, change: (wakeup: Wakeup | null) => Wakeup | null, isReplacement = false): Promise<void> {
+  if (!mirror.isLoaded) await loaded($)
+  const before = memory.wakeup
+  memory.wakeup = wakeupWritten(before, now, change, isReplacement)
+  if (memory.wakeup !== before) await persisted($, deadline)
+  await ensureTicker($)
+}
+
+/**
+ * Memory after a load of the module. A reload of the mod starts module variables empty, keeps `$.state`, and fires
+ * session.start again. So the first session.start, the first change of memory, or the first mirror write, whichever
+ * comes first, reads the mirror into memory, once. Each change waits for that read and applies on top of it, and no
+ * mirror write goes out before it: the mirror is never written from empty memory over its own data. A failed read is
+ * tried again at the next change. A later session.start of the same module keeps memory.
+ */
+function loaded($: EngineInterface): Promise<void> {
+  mirror.load ??= seeded($).catch((error: unknown) => {
+    mirror.load = null
+    throw error
+  })
+  return mirror.load
+}
+
+/**
+ * Starts memory from the mirror, which holds the current session's view: its running jobs, its ended jobs, the removals,
+ * and the wakeup (Hide stays in its own atom). No change of memory runs before it ends (see loaded). A stored shape to
+ * update, an invalid value, and rows that the current options change go back to the mirror at once; with none of
+ * them, nothing is written.
+ */
+async function seeded($: EngineInterface): Promise<void> {
+  const now = await $.clock.now()
+  const [storedJobs, storedWakeup] = await Promise.all([$.state.get({ plugin: 'downrange', key: 'jobs' }), $.state.get({ plugin: 'downrange', key: 'wakeup' })])
+  const jobs = jobsStateOf(storedJobs.value)
+  if (storedJobs.value !== undefined && jobs === undefined) report($, 'state.get', 'unsupported or invalid jobs state; reset safely', 'jobs-shape')
+  const wakeup = wakeupStateOf(storedWakeup.value)
+  if (storedWakeup.value !== undefined && wakeup === undefined) report($, 'state.get', 'unsupported or invalid wakeup state; reset safely', 'wakeup-shape')
+  memory.jobs = jobs ?? NO_JOBS
+  memory.wakeup = wakeup ?? NO_WAKEUP
+  // After a reload, as a change of genericRatios or an update causes, rows follow the current option. They keep their
+  // observation times: an input that came after the reload, before this read ended, is judged by them, not by the read.
+  const items = reloaded(memory.jobs.items, isAnyRatio, now)
+  const isReloaded = items.some((job, index) => job !== memory.jobs.items[index])
+  if (isReloaded) memory.jobs = { ...memory.jobs, items }
+  const isJobsOld = storedJobs.value !== undefined && (jobs === undefined || storedJobs.value.shape !== 'v8')
+  const isWakeupOld = storedWakeup.value !== undefined && (wakeup === undefined || storedWakeup.value.shape !== 'v4')
+  mirror.isLoaded = true
+  // The new shape goes to the mirror; the hook that waits for the read waits for its own change, not for this write.
+  if (isReloaded || isJobsOld || isWakeupOld) carrying($)
+}
+
+/** Makes session `id` the current one from `at` on, and keeps the MAX_SESSIONS most recent sessions. */
+function entered(id: string | undefined, at: number): void {
+  since = at
+  if (id === undefined) return
+  sessions.delete(id)
+  sessions.set(id, at)
+  for (const oldest of sessions.keys()) {
+    if (sessions.size <= MAX_SESSIONS) break
+    sessions.delete(oldest)
   }
 }
 
@@ -275,7 +420,7 @@ async function recordRuns($: EngineInterface, runs: readonly HistoryRun[], now: 
 }
 
 /** Applies every notification block in a delivered prompt, in order; history judges each block on the list the blocks before it left. */
-async function applyNotices($: EngineInterface, text: string, noticeRow?: string, observedAt?: number): Promise<void> {
+async function applyNotices($: EngineInterface, deadline: Deadline, text: string, noticeRow?: string, observedAt?: number): Promise<void> {
   const event = noticeRow === undefined ? 'prompt.submit' : 'session.append'
   const notices = noticesOf(text)
   if (notices.length === 0) {
@@ -287,20 +432,17 @@ async function applyNotices($: EngineInterface, text: string, noticeRow?: string
   }
   const now = observedAt ?? await $.clock.now()
   let runs: HistoryRun[] = []
-  const changed = await writeJobs($, { at: now, ids: notices.flatMap(notice => notice.ids), kind: 'notice', finalIds: finalIdsOf(notices), noticeRow }, jobs => {
+  const changed = await writeJobs($, deadline, { at: now, ids: notices.flatMap(notice => notice.ids), kind: 'notice', finalIds: finalIdsOf(notices), noticeRow }, jobs => {
     runs = finishedRuns(jobs, notices, now)
     return notices.reduce((list, notice) => noticed(list, notice, now, isAnyRatio), jobs)
   })
   if (changed) await recordRuns($, runs, now, event)
 }
 
-/**
- * Reconciles with a Stop or SubagentStop snapshot: the wakeup with `session_crons`, the jobs with `background_tasks`;
- * an absent field logs once. The wakeup rule runs again on the wakeup that stands at the write, so a wakeup set
- * meanwhile is judged by its own time.
- */
+/** Reconciles with a Stop or SubagentStop snapshot: the wakeup with `session_crons`, the jobs with `background_tasks`; an absent field logs once. */
 async function reconcile(
   $: EngineInterface,
+  deadline: Deadline,
   event: string,
   input: { background_tasks?: readonly SnapshotTask[]; session_crons?: readonly { recurring: boolean }[] },
 ): Promise<void> {
@@ -309,15 +451,14 @@ async function reconcile(
   if (crons === undefined) {
     report($, event, 'no session_crons in the hook input; a cancelled wakeup waits for its expiry', 'no-crons')
   } else {
-    const { pending: wakeup } = await read($, WAKEUP)
-    if (wakeupAfterSnapshot(wakeup, crons, now) !== wakeup) await writeWakeup($, now, current => wakeupAfterSnapshot(current, crons, now))
+    await writeWakeup($, deadline, now, current => wakeupAfterSnapshot(current, crons, now))
   }
   const tasks = input.background_tasks
   if (tasks === undefined) {
     report($, event, 'no background_tasks in the hook input; reconciliation skipped', 'no-snapshot')
     return
   }
-  await writeJobs($, { at: now, kind: 'snapshot', members: tasks.map(task => task.id) }, jobs => reconciled(jobs, tasks, now))
+  await writeJobs($, deadline, { at: now, kind: 'snapshot', members: tasks.map(task => task.id) }, jobs => reconciled(jobs, tasks, now))
 }
 
 /** Runs `tail -c 16384 <path>`: the last TAIL_BYTES bytes, written as text so the command reads in full; only the output file path varies. */
@@ -382,11 +523,11 @@ async function redirectRead($: EngineInterface, job: ShellJob & { outputFile: st
 }
 
 /** Reads one shell job's output and applies it; only a failed stat, read, or tail sets the job's note and logs once per job and file. */
-async function readTail($: EngineInterface, job: ShellJob & { outputFile: string }, now: number): Promise<void> {
+async function readTail($: EngineInterface, deadline: Deadline, job: ShellJob & { outputFile: string }, now: number): Promise<void> {
   const path = job.outputFile
   if (!isOutputFileOf(path, job.id)) {
     report($, 'clock.every', `refused to read ${path}: it is not the output file of task ${job.id}`, `path|${job.id}`)
-    await writeJobs($, { at: now, ids: [job.id] }, jobs => readFailed(jobs, job.id, 'output unavailable', now))
+    await writeJobs($, deadline, { at: now, ids: [job.id] }, jobs => readFailed(jobs, job.id, 'output unavailable', now))
     return
   }
   let found: TailRead
@@ -398,19 +539,19 @@ async function readTail($: EngineInterface, job: ShellJob & { outputFile: string
     const bytes = failure instanceof TailFailure ? failure.bytes : undefined
     const verb = bytes === undefined ? 'read' : 'tail'
     report($, 'clock.every', `cannot ${verb} ${isRedirect ? 'the redirect file' : 'the output'} of task ${job.id}: ${messageOf(failure)}`, `${isRedirect ? 'redirect ' : ''}${verb}|${job.id}`)
-    await writeJobs($, { at: now, ids: [job.id] }, jobs => readFailed(jobs, job.id, bytes === undefined ? 'output unavailable' : 'tail failed', now, bytes))
+    await writeJobs($, deadline, { at: now, ids: [job.id] }, jobs => readFailed(jobs, job.id, bytes === undefined ? 'output unavailable' : 'tail failed', now, bytes))
     return
   }
-  await writeJobs($, { at: now, ids: [job.id] }, jobs => tailRead(jobs, job.id, found, now, isAnyRatio))
+  await writeJobs($, deadline, { at: now, ids: [job.id] }, jobs => tailRead(jobs, job.id, found, now, isAnyRatio))
 }
 
 /** Applies `$.agent.list()` to agent jobs; a failed list logs once. */
-async function syncAgents($: EngineInterface, now: number, event = 'clock.every'): Promise<void> {
+async function syncAgents($: EngineInterface, deadline: Deadline, now: number, event = 'clock.every'): Promise<void> {
   const agents = await $.agent.list().catch((error: unknown) => {
     report($, event, `cannot list agents: ${messageOf(error)}`, 'agents')
     return undefined
   })
-  if (agents !== undefined) await writeJobs($, { at: now, ids: agents.map(agent => agent.id) }, jobs => agentsSynced(jobs, agents, now))
+  if (agents !== undefined) await writeJobs($, deadline, { at: now, ids: agents.map(agent => agent.id) }, jobs => agentsSynced(jobs, agents, now))
 }
 
 /** One ticker period: it marks the ticker alive, then refreshes unless a refresh still runs; a failure logs once per message. */
@@ -421,7 +562,6 @@ async function tick($: EngineInterface): Promise<void> {
     if (isTicking) return
     isTicking = true
     try {
-      await restoreCarry($)
       await refresh($, now)
     } finally {
       isTicking = false
@@ -431,15 +571,20 @@ async function tick($: EngineInterface): Promise<void> {
   }
 }
 
-/** The work of one tick: expire the wakeup, sync agents, read outputs (a pending final read too), redraw, and stop when nothing is live. */
+/**
+ * The work of one tick: expire the wakeup, sync agents, read outputs (a pending final read too), write a mirror that
+ * fell behind, redraw, and stop when nothing is live.
+ */
 async function refresh($: EngineInterface, now: number): Promise<void> {
-  const seen = latest
-  const [{ items: jobs }, { pending: wakeup }] = await Promise.all([read($, JOBS), read($, WAKEUP)])
-  if (wakeupAfterTick(wakeup, now) !== wakeup) await writeWakeup($, now, current => wakeupAfterTick(current, now))
-  if (jobs.some(job => job.kind === 'agent' && isRunning(job))) await syncAgents($, now)
-  for (const job of readsDue(jobs, now)) await readTail($, job, now)
-  // Every write replaces `latest`: after a write during this tick, the next tick judges liveness on fresh state.
-  if (!isLive(jobs, wakeup, now) && latest === seen && (carry === null || carry.attempts >= CARRY_ATTEMPTS || carry.destination === undefined)) {
+  const deadline = deadlineOf()
+  const seen = { ...memory }
+  const { jobs: { items: shown }, wakeup: { pending: wakeup } } = viewNow()
+  if (wakeupAfterTick(wakeup, now) !== wakeup) await writeWakeup($, deadline, now, current => wakeupAfterTick(current, now))
+  if (seen.jobs.items.some(job => job.kind === 'agent' && isRunning(job))) await syncAgents($, deadline, now)
+  for (const job of readsDue(seen.jobs.items, now)) await readTail($, deadline, job, now)
+  if (mirror.isBehind) await mirrored($, deadline)
+  // Every change replaces the jobs or the wakeup: after a change during this tick, the next tick judges liveness on fresh data.
+  if (!isLive(shown, wakeup, now) && memory.jobs === seen.jobs && memory.wakeup === seen.wakeup && mirror.writing === null && !mirror.isBehind) {
     ticker?.cancel()
     ticker = null
   }
@@ -456,7 +601,7 @@ async function pressed($: EngineInterface, control: Control): Promise<void> {
       const now = await $.clock.now()
       await update($, BAND_HIDDEN_AT, () => now)
     } else if (control === 'Clear finished') {
-      await writeJobs($, { at: await $.clock.now() }, finishedCleared)
+      await writeJobs($, deadlineOf(), { at: await $.clock.now() }, finishedCleared)
     } else {
       await $.ui.close({ id: PANE_ID })
     }
@@ -524,30 +669,29 @@ export const register: Register = (on, options) => {
     } catch (error) {
       $.ui.log(`downrange: session.start: /downrange was not registered: ${messageOf(error)}`)
     }
-    const now = await $.clock.now()
-    await writeJobs($, null)
-    // After a reload, as a change of genericRatios or an update causes, rows follow the current option; with no row to change, nothing is written.
-    const { items } = await read($, JOBS)
-    if (reloaded(items, isAnyRatio, now).some((job, index) => job !== items[index])) await writeJobs($, { at: now }, jobs => reloaded(jobs, isAnyRatio, now))
-    await writeWakeup($, now, pending => pending)
+    await loaded($)
+    // The session that this module first serves shows every ended job that memory holds; a later session.start of the
+    // module keeps the current session as it is. A session id that cannot be read keeps the session out of `sessions`.
+    const id = await $.session.id().catch(() => undefined)
+    if (id !== undefined && !sessions.has(id)) entered(id, since)
+    await ensureTicker($)
     return next(e)
   }).catch(($, e, next) => passOn($, 'session.start', e, next))
 
-  on('session.end', ($, e, next) => {
-    const current = latest.sessionId === e.sessionId ? latest : undefined
-    if (current === undefined && carry?.destination !== e.sessionId) return next(e)
-    const jobs = current === undefined ? carry?.jobs : carry === null ? current.jobs : restoredJobs(carry.jobs, current.jobs)
-    const wakeup = current === undefined || (carry?.wakeup.updatedAt ?? -Infinity) > (current.wakeup.updatedAt ?? -Infinity) ? carry?.wakeup : current.wakeup
-    if (jobs !== undefined && wakeup !== undefined) carry = { jobs: carriedJobs(jobs), wakeup, attempts: 0, restoring: false }
+  on('session.end', async ($, e, next) => {
+    // /clear, /resume, and /branch go on in this process: the next session that this process has not shown starts its
+    // Finished here. Memory stays as it is.
+    if (e.reason === 'clear' || e.reason === 'resume') switchedAt = await $.clock.now()
     return next(e)
   }).catch(($, e, next) => passOn($, 'session.end', e, next))
 
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
-    const sessionId = await $.session.id()
-    if (e.session_id !== sessionId) return next(e)
-    if (carry !== null && carry.destination === undefined) carry.destination = sessionId
+    // e.session_id names the session that starts; this hook asks no session id. The engine reset $.state, and the
+    // mirror write here puts the new session's view in it. One mirror write runs at a time, so a write that began
+    // before the switch lands first, and the write after it holds the new session's view (see mirrored).
+    entered(e.session_id, sessions.get(e.session_id) ?? switchedAt ?? await $.clock.now())
+    await persisted($, deadlineOf())
     await ensureTicker($)
-    await restoreCarry($)
     return next(e)
   }).catch(($, e, next) => passOn($, 'classic.SessionStart{source=clear|resume|fork}', e, next))
 
@@ -557,7 +701,7 @@ export const register: Register = (on, options) => {
     if (argument === 'pane') return togglePane($, e.presentation.columns)
     return { text: 'Usage: /downrange [pane]' }
   }).catch(($, e, next) => {
-    if (next.error.kind === 're-entry') return { text: '/downrange is unavailable during a nested call.' }
+    if (isReentry(next.error)) return { text: '/downrange is unavailable during a nested call.' }
     reportHook($, 'command.run{command=downrange}', next.error)
     return { text: `/downrange could not run: ${failureText(next.error)}.` }
   })
@@ -574,10 +718,11 @@ export const register: Register = (on, options) => {
     }
     const note = shellLaunchNote(ran.result, outputFile !== undefined)
     const redirectFile = await redirectFor($, id, e.command, e.agentId)
-    await writeJobs($, { at: now, ids: [id] }, jobs => launched(jobs, shellJob({ id, command: e.command, description: e.description, outputFile, redirectFile, note, ownerAgentId: e.agentId, endsWithAgent: ran.result.backgroundEndsWithFinalResponse === true }, now)))
+    const deadline = deadlineOf()
+    await writeJobs($, deadline, { at: now, ids: [id] }, jobs => launched(jobs, shellJob({ id, command: e.command, description: e.description, outputFile, redirectFile, note, ownerAgentId: e.agentId, endsWithAgent: ran.result.backgroundEndsWithFinalResponse === true }, now)))
     // The history read comes after the launch, so an end or a clear that comes meanwhile is never undone.
     const history = await historyFor($, e.command)
-    if (history !== undefined) await writeJobs($, { at: now, ids: [id] }, jobs => historyAdded(jobs, id, history))
+    if (history !== undefined) await writeJobs($, deadline, { at: now, ids: [id] }, jobs => historyAdded(jobs, id, history))
     return ran
   }).catch(($, e, next) => passOn($, 'tool.call{tool=Bash}', e, next))
 
@@ -586,7 +731,7 @@ export const register: Register = (on, options) => {
     if (ran.deny !== undefined || ran.isError === true) return ran
     const now = await $.clock.now()
     const job = monitorJob({ id: ran.result.taskId, description: e.description, timeoutMs: ran.result.timeoutMs, isPersistent: ran.result.persistent === true }, now)
-    await writeJobs($, { at: now, ids: [job.id] }, jobs => launched(jobs, job))
+    await writeJobs($, deadlineOf(), { at: now, ids: [job.id] }, jobs => launched(jobs, job))
     return ran
   }).catch(($, e, next) => passOn($, 'tool.call{tool=Monitor}', e, next))
 
@@ -605,7 +750,7 @@ export const register: Register = (on, options) => {
         : result.status === 'async_launched'
           ? agentJob({ id: result.agentId, description: result.description }, now)
           : agentJob({ id: result.taskId, description: result.description, note: 'remote', runsElsewhere: true }, now)
-    await writeJobs($, { at: now, ids: [job.id] }, jobs => launched(jobs, job))
+    await writeJobs($, deadlineOf(), { at: now, ids: [job.id] }, jobs => launched(jobs, job))
     return ran
   }).catch(($, e, next) => passOn($, 'tool.call{tool=Agent}', e, next))
 
@@ -614,7 +759,7 @@ export const register: Register = (on, options) => {
     if (ran.deny !== undefined || ran.isError === true || ran.result.error !== undefined) return ran
     const now = await $.clock.now()
     const job = workflowJob({ id: ran.result.taskId, name: ran.result.workflowName }, now)
-    await writeJobs($, { at: now, ids: [job.id] }, jobs => launched(jobs, job))
+    await writeJobs($, deadlineOf(), { at: now, ids: [job.id] }, jobs => launched(jobs, job))
     return ran
   }).catch(($, e, next) => passOn($, 'tool.call{tool=Workflow}', e, next))
 
@@ -623,7 +768,7 @@ export const register: Register = (on, options) => {
     if (ran.deny !== undefined || ran.isError === true) return ran
     const now = await $.clock.now()
     const wakeup = ran.result.stopped === true ? null : wakeupOf(ran.result.scheduledFor, e.reason, now)
-    await writeWakeup($, now, () => wakeup, true)
+    await writeWakeup($, deadlineOf(), now, () => wakeup, true)
     return ran
   }).catch(($, e, next) => passOn($, 'tool.call{tool=ScheduleWakeup}', e, next))
 
@@ -632,17 +777,19 @@ export const register: Register = (on, options) => {
     if (ran.deny !== undefined || ran.isError === true) return ran
     const now = await $.clock.now()
     const id = ran.result.task_id
-    await writeJobs($, { at: now, ids: [id] }, jobs => stoppedJob(jobs, id, now))
+    await writeJobs($, deadlineOf(), { at: now, ids: [id] }, jobs => stoppedJob(jobs, id, now))
     return ran
   }).catch(($, e, next) => passOn($, 'tool.call{tool=TaskStop}', e, next))
 
   on('tool.call', async ($, e, next) => {
     const agentId = e.agentId
     if (agentId === undefined) return next(e)
-    if (!(await read($, JOBS)).items.some(job => job.kind === 'agent' && job.id === agentId)) return next(e)
+    if (!mirror.isLoaded) await loaded($)
+    if (!memory.jobs.items.some(job => job.kind === 'agent' && job.id === agentId)) return next(e)
     const started = await $.clock.now()
     const summary = activityOf(String(e.tool), e)
-    await writeJobs($, { at: started, ids: [agentId], kind: 'activity' }, jobs => activityStarted(jobs, agentId, summary, started))
+    const deadline = deadlineOf()
+    await writeJobs($, deadline, { at: started, ids: [agentId], kind: 'activity' }, jobs => activityStarted(jobs, agentId, summary, started))
     // A call that rejects counts as failed; the in-flight count drops whatever happens.
     let isFailure = true
     try {
@@ -651,7 +798,7 @@ export const register: Register = (on, options) => {
       return ran
     } finally {
       const settled = await $.clock.now()
-      await writeJobs($, { at: settled, ids: [agentId], kind: 'activity' }, jobs => activityEnded(jobs, agentId, isFailure, settled))
+      await writeJobs($, deadline, { at: settled, ids: [agentId], kind: 'activity' }, jobs => activityEnded(jobs, agentId, isFailure, settled))
     }
   }).catch(($, e, next) => passOn($, 'tool.call', e, next))
 
@@ -661,7 +808,7 @@ export const register: Register = (on, options) => {
     const stored = await next(e)
     if (stored.deny !== undefined || stored.uuid !== e.uuid) return stored
     const text = stored.message.content.flatMap(block => block.type === 'text' && 'text' in block && typeof block.text === 'string' ? [block.text] : []).join('\n')
-    await applyNotices($, text, JSON.stringify([e.agentId, stored.uuid]), now)
+    await applyNotices($, deadlineOf(), text, JSON.stringify([e.agentId, stored.uuid]), now)
     return stored
   }).catch(($, e, next) => passOn($, 'session.append', e, next))
 
@@ -669,21 +816,22 @@ export const register: Register = (on, options) => {
     const now = await $.clock.now()
     const result = await next(e)
     if (e.agentId !== undefined) {
+      const deadline = deadlineOf()
       if (e.reason === 'answer' && !e.isAborted) {
         const agentId = e.agentId
-        await writeJobs($, { at: now }, jobs => ownerAnswered(jobs, agentId, now))
+        await writeJobs($, deadline, { at: now }, jobs => ownerAnswered(jobs, agentId, now))
       }
-      await syncAgents($, await $.clock.now(), 'turn.complete')
+      await syncAgents($, deadline, await $.clock.now(), 'turn.complete')
     }
     return result
   }).catch(($, e, next) => passOn($, 'turn.complete', e, next))
 
   on('prompt.submit', async ($, e, next) => {
     if (e.origin.kind === 'task-notification') {
-      await applyNotices($, e.text)
+      await applyNotices($, deadlineOf(), e.text)
     } else if (e.origin.kind === 'scheduled-trigger') {
       const now = await $.clock.now()
-      await writeWakeup($, now, wakeup => wakeupAfterTrigger(wakeup, now))
+      await writeWakeup($, deadlineOf(), now, wakeup => wakeupAfterTrigger(wakeup, now))
     } else if (options.answerStatusPrompts === true && e.origin.kind === 'composer' && e.turnId === undefined && e.attachments === undefined) {
       const answer = await statusAnswer($, e.text)
       if (answer !== undefined) return { drop: answer }
@@ -692,14 +840,16 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => passOn($, 'prompt.submit', e, next))
 
   on('classic.Stop', async ($, e, next) => {
-    await reconcile($, 'classic.Stop', e)
-    if ((await read($, JOBS)).items.some(job => job.kind === 'agent')) await syncAgents($, await $.clock.now(), 'classic.Stop')
+    const deadline = deadlineOf()
+    await reconcile($, deadline, 'classic.Stop', e)
+    if (memory.jobs.items.some(job => job.kind === 'agent')) await syncAgents($, deadline, await $.clock.now(), 'classic.Stop')
     return next(e)
   }).catch(($, e, next) => passOn($, 'classic.Stop', e, next))
 
   on('classic.SubagentStop', async ($, e, next) => {
-    await reconcile($, 'classic.SubagentStop', e)
-    if ((await read($, JOBS)).items.some(job => job.kind === 'agent')) await syncAgents($, await $.clock.now(), 'classic.SubagentStop')
+    const deadline = deadlineOf()
+    await reconcile($, deadline, 'classic.SubagentStop', e)
+    if (memory.jobs.items.some(job => job.kind === 'agent')) await syncAgents($, deadline, await $.clock.now(), 'classic.SubagentStop')
     return next(e)
   }).catch(($, e, next) => passOn($, 'classic.SubagentStop', e, next))
 
@@ -731,7 +881,7 @@ export const register: Register = (on, options) => {
     }
     return paneTree($.ui.resolve(e), paneModelOf(jobs, wakeup, now, e.props.bodyColumns), actions)
   }).catch(($, e, next) => {
-    if (next.error.kind === 're-entry') return { type: 'Text', props: {}, children: ['The Jobs pane is unavailable during a nested render.'] }
+    if (isReentry(next.error)) return { type: 'Text', props: {}, children: ['The Jobs pane is unavailable during a nested render.'] }
     reportHook($, 'ui.render{component=Pane, requestId=downrange}', next.error)
     return failedPaneTree($.ui.resolve(e), `The Jobs pane could not draw: ${failureText(next.error)}`)
   })
