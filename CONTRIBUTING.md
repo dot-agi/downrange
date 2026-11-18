@@ -21,7 +21,7 @@ npx -p typescript tsc -p .
 
 - `claude plugin validate .` checks the marketplace manifest. `claude plugin validate .claude-plugin/plugin.json` checks the plugin manifest, the hooks module, and every `$` call.
 - `claude plugin test .` runs the `*.test.ts` files under `tests/` against the engine's own `$`, with stubs for tool results, files, and processes. The repository does not track tests. Keep yours in a local `tests/` folder, out of your commits. They import `test`, `expect`, and `mock` from `claude-code/testing`. With no test file, the command stops with `no *.test.ts or *.test.tsx`.
-- `tsc` checks the types against `.claude-plugin/types/`. The hooks read the results of the built-in `Monitor`, `ScheduleWakeup`, `Workflow`, and `TaskStop` tools, so the type check needs a Claude Code build whose tool table has them. On a build without one, its results type as `unknown` and the check fails.
+- `tsc` checks the types against `.claude-plugin/types/`. The hooks read tool results from transcript rows as plain records, so the check needs no tool of a given build's tool table.
 
 ## Making a change
 

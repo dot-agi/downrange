@@ -1,11 +1,12 @@
 import { atom, read, update } from 'claude-code'
 import type { Caught, CommandRunResult, EngineInterface, HookFailure, Register, Timer } from 'claude-code'
 
-import type { Job, JobsState, ShellJob, Wakeup, WakeupState } from '../types'
+import type { AgentJob, Job, JobsState, ShellJob, Wakeup, WakeupState } from '../types'
 import { bandTree, failedPaneTree, paneTree } from './drawing'
 import { durationsOf, historyKeyOf, recorded, usualOf } from './history'
 import type { Durations } from './history'
 import {
+  activityClosed,
   activityEnded,
   activityOf,
   activityStarted,
@@ -40,12 +41,37 @@ import {
   workflowJob,
 } from './jobs'
 import type { HistoryRun, JobObservation, SnapshotTask, TailRead } from './jobs'
-import { FS_READ_MAX, MAX_SESSIONS, MIRROR_WAIT_MS, REPEAT_WINDOW_MS, TAIL_TIMEOUT_MS, TICK_MS, TICKER_STALE_MS } from './limits'
+import {
+  BARE_RESULT_MS,
+  DELIVERED_MAX,
+  EARLY_AGENTS_MAX,
+  EARLY_ROWS_MAX,
+  EARLY_ROWS_MS,
+  FIRST_HOLD_MS,
+  FIRST_WAIT_MS,
+  FLUSH_WAIT_MS,
+  FS_READ_MAX,
+  INPUTS_MAX,
+  LOOKUP_DELAYS_MS,
+  LOOKUP_LAST,
+  MAX_SESSIONS,
+  MIRROR_WAIT_MS,
+  MONITOR_TIMEOUT_MAX_MS,
+  OPEN_CALL_MS,
+  OPEN_CALLS_MAX,
+  REPEAT_WINDOW_MS,
+  TAIL_TIMEOUT_MS,
+  TICK_MS,
+  TICKER_STALE_MS,
+  WAITING_MAX,
+} from './limits'
 import { noticesOf } from './notices'
 import { closingCodeOf, displayLinesOf, isOutputFileOf, jobBytesOf, jobLinesOf, oneLine, outputEndOf, outputFileOf } from './output'
 import { jobsStateOf, wakeupStateOf } from './state'
 import { isStatusPrompt, normalizePrompt } from './prompt'
 import { redirectFileOf, redirectTargetOf } from './redirect'
+import { backgroundIdOf, callInputOf, earlyKept, isBackgroundText, isFields, isResultListed, monitorIdOf, numberOf, resultsOf, stringOf, teammateIdOf, toolResultsOf, toolUsesOf, waitingTextOf } from './rows'
+import type { Fields, RowCall } from './rows'
 import { bandHintOf, bandOf, isBandHidden, paneModelOf, tableOf } from './view'
 
 /** The slash command, without its slash; declared here so that `claude plugin validate` resolves the matcher. */
@@ -112,6 +138,36 @@ const mirror: { load: Promise<void> | null; isLoaded: boolean; writing: Write | 
 let historyWrites: Promise<void> = Promise.resolve()
 /** The `genericRatios` option, which register sets: any ratio in output counts as progress, not only a known format. */
 let isAnyRatio = false
+
+/** The tools whose finished calls start, stop, or set work: their result rows reach applyCall. */
+const CALL_TOOLS: ReadonlySet<string> = new Set(['Bash', 'Monitor', 'Agent', 'Workflow', 'ScheduleWakeup', 'TaskStop'])
+/** The tool that runs a Code Mode script: a subagent's script is in flight, but counts no tool. */
+const SCRIPT_TOOL = 'REPL'
+/** A result row that waits for its stored result: the response row to read on from, the reads made, and when the next one is due. */
+type Waiting = { call: RowCall; after?: string; tries: number; due: number }
+/** One step of a subagent's tool activity, from its rows: a call starts, or its result row comes. */
+type Activity = { kind: 'start'; id: string; summary: string; isCounted: boolean; at: number } | { kind: 'end'; id: string; isFailure: boolean; at: number }
+/** One read of `$.session.messages()`: whose conversation, and which part of it. */
+type TranscriptArgs = { agentId?: string; after?: string; last?: number }
+/**
+ * The tool calls that reach the mod as transcript rows (see resultApplied), in module memory only: a reload empties it.
+ * `inputs` holds the tool, input, and response row of each call of a tracked tool until its result row comes, `waiting`
+ * the result rows that wait for their stored result, `timer` the next due read, `ranged` whether `$.session.messages()`
+ * took `after` and `last` (undefined until a read answers), `delivered` the tool use ids that applied, `open` each
+ * tracked agent's calls in flight, `early` the activity rows of agents whose launch has not landed yet, EARLY_ROWS_MS at
+ * most, and `earlyTimer` the timer that drops them.
+ */
+const rows = {
+  inputs: new Map<string, { tool: string; input: Fields; uuid: string }>(),
+  waiting: new Map<string, Waiting>(),
+  timer: null as Timer | null,
+  timerAt: 0,
+  ranged: undefined as boolean | undefined,
+  delivered: new Set<string>(),
+  open: new Map<string, Map<string, { at: number; isCounted: boolean }>>(),
+  early: new Map<string, Activity[]>(),
+  earlyTimer: null as Timer | null,
+}
 
 /** A `tail` that could not start, timed out, or exited non-zero. */
 class TailFailure extends Error {
@@ -453,9 +509,9 @@ async function storedDurations($: EngineInterface, event: string): Promise<Durat
 async function historyFor($: EngineInterface, command: string): Promise<{ historyKey: string; usualMs?: number } | undefined> {
   try {
     const historyKey = await historyKeyOf(await $.session.cwd(), command)
-    return { historyKey, usualMs: usualOf(await storedDurations($, 'tool.call'), historyKey) }
+    return { historyKey, usualMs: usualOf(await storedDurations($, rowLabel('Bash')), historyKey) }
   } catch (error) {
-    report($, 'tool.call', `duration history unavailable: ${messageOf(error)}`, 'history-get')
+    report($, rowLabel('Bash'), `duration history unavailable: ${messageOf(error)}`, 'history-get')
     return undefined
   }
 }
@@ -470,9 +526,428 @@ async function redirectFor($: EngineInterface, id: string, command: string, agen
     if (target === undefined || (agentId !== undefined && !target.startsWith('/'))) return undefined
     return redirectFileOf(target, await $.session.cwd())
   } catch (error) {
-    report($, 'tool.call', `cannot place the redirect file of task ${id}: ${messageOf(error)}`, `redirect|${id}`)
+    report($, rowLabel('Bash'), `cannot place the redirect file of task ${id}: ${messageOf(error)}`, `redirect|${id}`)
     return undefined
   }
+}
+
+/** The diagnostic label of a tool's rows. */
+const rowLabel = (tool: string): string => `session.append (${tool})`
+
+/** Drops the oldest entries of a map or a set while it holds more than `max`. */
+function capped(entries: { readonly size: number; keys(): IterableIterator<string>; delete(key: string): boolean }, max: number): void {
+  for (const oldest of entries.keys()) {
+    if (entries.size <= max) break
+    entries.delete(oldest)
+  }
+}
+
+/** Waits for `work`, `ms` at most; a failure of the work logs once per message under `event`. */
+function within($: EngineInterface, event: string, ms: number, work: Promise<void>): Promise<void> {
+  return new Promise<void>(resolve => {
+    const timer = $.clock.after(ms, () => resolve())
+    work.then(
+      () => {
+        timer.cancel()
+        resolve()
+      },
+      (error: unknown) => {
+        timer.cancel()
+        report($, event, `a read of stored tool results failed: ${messageOf(error)}`, `rows|${messageOf(error)}`)
+        resolve()
+      },
+    )
+  })
+}
+
+/**
+ * Whether a call needs its stored result: not a failed call, which changes nothing; not a call with no text, such as a
+ * successful call inside a Code Mode script, whose result the transcript does not store; and not a Bash call whose text
+ * does not say that it runs in the background.
+ */
+function needsResult(call: RowCall): boolean {
+  if (call.isError || call.text === '') return false
+  return call.tool !== 'Bash' || isBackgroundText(call.text)
+}
+
+/** A response row or a result row of a loop, as the session.append hook passes it on. */
+type Row = { uuid: string; agentId?: string; tool?: string; content: unknown }
+
+/**
+ * Applies a response row: it keeps the fields of the input of each call of a tracked tool (CALL_TOOLS) that its change
+ * reads (see callInputOf) until the call's result row comes. A subagent's response row also starts its calls (see
+ * activityRow); `at`, the row's time, is set for it.
+ */
+async function responseApplied($: EngineInterface, deadline: Deadline, row: Row, at: number | null): Promise<void> {
+  for (const use of toolUsesOf(row.content)) {
+    if (CALL_TOOLS.has(use.name)) {
+      rows.inputs.set(use.id, { tool: use.name, input: callInputOf(use.name, use.input), uuid: row.uuid })
+      capped(rows.inputs, INPUTS_MAX)
+    }
+    if (row.agentId !== undefined && at !== null) await activityRow($, deadline, row.agentId, { kind: 'start', id: use.id, summary: activityOf(use.name, use.input), isCounted: use.name !== SCRIPT_TOOL, at })
+  }
+}
+
+/**
+ * Applies a result row that came at `now`: it hands each call of a tracked tool to applyCall, at once when its text is
+ * enough, else after reads of its stored result, the first one now and the others on a timer (see lookedUp). A call
+ * that waits keeps only the parts of its text that applyCall reads (see waitingTextOf). A subagent's result row also ends
+ * its calls (see activityRow).
+ */
+async function resultApplied($: EngineInterface, deadline: Deadline, row: Row, now: number): Promise<void> {
+  const ready: RowCall[] = []
+  for (const block of toolResultsOf(row.content)) {
+    if (row.agentId !== undefined) await activityRow($, deadline, row.agentId, { kind: 'end', id: block.id, isFailure: block.isError, at: now })
+    const kept = rows.inputs.get(block.id)
+    rows.inputs.delete(block.id)
+    const tool = row.tool !== undefined && row.tool !== 'unknown' ? row.tool : kept?.tool
+    if (tool === undefined || !CALL_TOOLS.has(tool) || rows.delivered.has(block.id) || rows.waiting.has(block.id)) continue
+    const call: RowCall = { id: block.id, tool, input: kept?.input ?? {}, text: block.text, isError: block.isError, at: now, ...(row.agentId === undefined ? {} : { agentId: row.agentId }) }
+    if (!needsResult(call)) {
+      ready.push(call)
+      continue
+    }
+    rows.waiting.set(call.id, { call: { ...call, text: waitingTextOf(tool, call.text) }, ...(kept === undefined ? {} : { after: kept.uuid }), tries: 0, due: now })
+    // Past the cap, the oldest row goes on with its text only.
+    for (const [id, oldest] of rows.waiting) {
+      if (rows.waiting.size <= WAITING_MAX) break
+      rows.waiting.delete(id)
+      ready.push(oldest.call)
+    }
+  }
+  await delivered($, deadline, ready)
+  if (rows.waiting.size > 0) await lookedUp($, deadline, 'due', 'session.append')
+}
+
+/** One read of `$.session.messages()`: the rows, or the cause when it failed or answered a deny. */
+async function messagesOf($: EngineInterface, args: TranscriptArgs): Promise<{ rows: unknown[] } | { cause: string }> {
+  try {
+    const answer: unknown = await $.session.messages(args)
+    if (Array.isArray(answer)) return { rows: answer }
+    return { cause: isFields(answer) && typeof answer.deny === 'string' ? answer.deny : 'the answer held no rows' }
+  } catch (error) {
+    return { cause: messageOf(error) }
+  }
+}
+
+/** Logs once per event that no form of a read of stored results answered rows, with the cause of the last form. */
+function unread($: EngineInterface, event: string, answer: { rows: unknown[] } | { cause: string }): void {
+  if ('cause' in answer) report($, event, `could not read stored tool results: ${answer.cause}`, 'messages')
+}
+
+/**
+ * The stored rows of an agent's conversation, or of the main one: the rows after the response row `after`, else the
+ * newest LOOKUP_LAST, else the whole conversation on a build that takes neither. The first answer tells which the build
+ * takes. A form that the build refuses logs nothing; a read that no form answered logs once per event (see unread).
+ */
+async function transcriptOf($: EngineInterface, event: string, agentId: string | undefined, after: string | undefined): Promise<unknown[] | undefined> {
+  const scope: TranscriptArgs = agentId === undefined ? {} : { agentId }
+  let answer: { rows: unknown[] } | { cause: string } | undefined
+  if (rows.ranged !== false) {
+    if (after !== undefined) answer = await messagesOf($, { ...scope, after })
+    if (answer === undefined || 'cause' in answer) answer = await messagesOf($, { ...scope, last: LOOKUP_LAST })
+    if ('rows' in answer) rows.ranged = true
+  }
+  if ((answer === undefined || 'cause' in answer) && rows.ranged !== true) {
+    answer = await messagesOf($, scope)
+    if ('rows' in answer) rows.ranged = false
+  }
+  if (answer === undefined) return undefined
+  unread($, event, answer)
+  return 'rows' in answer ? answer.rows : undefined
+}
+
+/**
+ * Reads of stored results for the result rows that wait, one per agent and response row: in `due` mode only where a
+ * row's read is due (LOOKUP_DELAYS_MS after its result row), else for every row. A call whose result the transcript
+ * holds goes to applyCall with it. One with none waits for its next due read; after its last one, or at once in `final`
+ * mode, it goes on with its text only. A read before a row's read is due counts no read for it. `event` names the hook
+ * or the timer in a diagnostic of a read.
+ */
+async function lookedUp($: EngineInterface, deadline: Deadline, mode: 'due' | 'first' | 'final', event: string): Promise<void> {
+  const now = await $.clock.now()
+  const groups = new Map<string, { agentId?: string; after?: string; waits: Waiting[] }>()
+  for (const wait of rows.waiting.values()) {
+    const key = JSON.stringify([wait.call.agentId ?? null, wait.after ?? null])
+    const group = groups.get(key) ?? { agentId: wait.call.agentId, after: wait.after, waits: [] }
+    group.waits.push(wait)
+    groups.set(key, group)
+  }
+  const ready: RowCall[] = []
+  for (const { agentId, after, waits } of groups.values()) {
+    if (mode === 'due' && waits.every(wait => wait.due > now)) continue
+    const ids = new Set(waits.map(wait => wait.call.id))
+    const answer = await transcriptOf($, event, agentId, after)
+    let found = resultsOf(answer, ids)
+    // A result row that the read still lists with no stored result BARE_RESULT_MS after it came: the response row, which a
+    // read of the newest rows holds, can carry the result that the result row does not. A build that refuses ranged
+    // reads gets no such read: its read of the whole conversation already holds the response rows.
+    if (rows.ranged !== false && after !== undefined && waits.some(wait => !found.has(wait.call.id) && now - wait.call.at >= BARE_RESULT_MS && isResultListed(answer, wait.call.id))) {
+      const newest = await messagesOf($, { ...(agentId === undefined ? {} : { agentId }), last: LOOKUP_LAST })
+      unread($, event, newest)
+      found = new Map([...resultsOf('rows' in newest ? newest.rows : undefined, ids), ...found])
+    }
+    for (const wait of waits) {
+      // Another read took this row meanwhile.
+      if (rows.waiting.get(wait.call.id) !== wait) continue
+      const answer = found.get(wait.call.id)
+      if (answer === undefined && mode !== 'final') {
+        if (wait.due > now) continue
+        wait.tries += 1
+        const delay = LOOKUP_DELAYS_MS[wait.tries]
+        if (delay !== undefined) {
+          wait.due = wait.call.at + delay
+          continue
+        }
+      }
+      rows.waiting.delete(wait.call.id)
+      const input = Object.keys(wait.call.input).length > 0 ? wait.call.input : answer?.input ?? {}
+      ready.push(answer !== undefined && isFields(answer.result) ? { ...wait.call, input, result: answer.result } : { ...wait.call, input })
+    }
+  }
+  await delivered($, deadline, ready)
+  lookupScheduled($, now)
+}
+
+/** Sets the one timer of reads of stored results to the earliest due row, or ends it when no row waits. */
+function lookupScheduled($: EngineInterface, now: number): void {
+  const due = Math.min(...[...rows.waiting.values()].map(wait => wait.due))
+  if (!Number.isFinite(due)) {
+    rows.timer?.cancel()
+    rows.timer = null
+    return
+  }
+  if (rows.timer !== null && rows.timerAt <= due) return
+  rows.timer?.cancel()
+  rows.timerAt = due
+  rows.timer = $.clock.after(Math.max(0, due - now), () => {
+    rows.timer = null
+    void lookupTick($)
+  })
+}
+
+/** A due read of stored results, on its timer: it settles a switch first, as a tick does; a failure logs once per message. */
+async function lookupTick($: EngineInterface): Promise<void> {
+  try {
+    const deadline = deadlineOf()
+    await switched($, deadline)
+    await lookedUp($, deadline, 'due', 'clock.after')
+  } catch (error) {
+    report($, 'clock.after', `a read of stored tool results failed: ${messageOf(error)}`, `lookup|${messageOf(error)}`)
+  }
+}
+
+/**
+ * Before an input that a launch must come before: one read for the rows that wait, FIRST_WAIT_MS at most. `isHeld`, for
+ * an input that a launch must not lose its details to, such as a notification or a snapshot: a row younger than
+ * FIRST_HOLD_MS that still waits gets one more read at that age. A drawing, such as `/downrange`, holds nothing.
+ */
+async function rowsFirst($: EngineInterface, deadline: Deadline, event: string, isHeld: boolean): Promise<void> {
+  if (rows.waiting.size > 0) await within($, event, FIRST_WAIT_MS, firstRead($, deadline, event, isHeld))
+}
+
+/** The reads of rowsFirst: Claude Code stores a main-loop result about 55 ms after its result row, so a young row can wait that long. */
+async function firstRead($: EngineInterface, deadline: Deadline, event: string, isHeld: boolean): Promise<void> {
+  await lookedUp($, deadline, 'first', event)
+  if (!isHeld) return
+  const now = await $.clock.now()
+  const holds = [...rows.waiting.values()].map(wait => wait.call.at + FIRST_HOLD_MS).filter(at => at > now)
+  if (holds.length === 0) return
+  await $.clock.sleep(Math.max(...holds) - now)
+  await lookedUp($, deadline, 'first', event)
+}
+
+/**
+ * Before a slash command or a /config change, which can reload the mod and empty its memory: one read, then every row
+ * that waits goes on, with its text only when the transcript holds no result yet; FLUSH_WAIT_MS at most.
+ */
+async function rowsFlushed($: EngineInterface, deadline: Deadline, event: string): Promise<void> {
+  if (rows.waiting.size > 0) await within($, event, FLUSH_WAIT_MS, lookedUp($, deadline, 'final', event))
+}
+
+/** Hands calls to applyCall, each tool use id once; a call that fails logs once per tool and message, and the others still apply. */
+async function delivered($: EngineInterface, deadline: Deadline, calls: readonly RowCall[]): Promise<void> {
+  for (const call of calls) {
+    if (rows.delivered.has(call.id)) continue
+    rows.delivered.add(call.id)
+    capped(rows.delivered, DELIVERED_MAX)
+    try {
+      await applyCall($, deadline, call)
+    } catch (error) {
+      report($, rowLabel(call.tool), `could not apply a call: ${messageOf(error)}`, `apply|${call.tool}|${messageOf(error)}`)
+    }
+  }
+}
+
+/**
+ * What a finished call of a tracked tool changes, from its input, its text, and its stored result when the transcript
+ * holds one. A failed call changes nothing. With no stored result, as for a call inside a Code Mode script, only the
+ * input and the engine's words at the start of the text count, and a launch that they do not describe changes nothing.
+ * A ScheduleWakeup with no stored result changes nothing, also when a flush applies it: its outcome is unknown, so
+ * the wakeup stays as it was until a scheduled prompt, a snapshot, or its expiry clears it.
+ * Each change carries the time of the call's result row: a launch or a wakeup that applies after a newer input of its
+ * task does not undo that input.
+ */
+async function applyCall($: EngineInterface, deadline: Deadline, call: RowCall): Promise<void> {
+  if (call.isError) return
+  const { input, result, at } = call
+  if (call.tool === 'Bash') {
+    await shellLaunched($, deadline, call)
+  } else if (call.tool === 'Monitor') {
+    const id = result === undefined ? monitorIdOf(call.text) : stringOf(result.taskId)
+    if (id === undefined || id === '') return
+    // The Monitor tool caps a larger timeout of its input; a stored result holds the capped one.
+    const timeoutMs = result === undefined ? Math.min(numberOf(input.timeout_ms) ?? 0, MONITOR_TIMEOUT_MAX_MS) : numberOf(result.timeoutMs) ?? 0
+    const isPersistent = (result === undefined ? input.persistent : result.persistent) === true
+    const job = monitorJob({ id, description: stringOf(input.description) ?? '', timeoutMs, isPersistent }, at)
+    await writeJobs($, deadline, { at, ids: [id] }, jobs => launched(jobs, job))
+  } else if (call.tool === 'Agent') {
+    await agentLaunched($, deadline, call)
+  } else if (call.tool === 'Workflow') {
+    const id = stringOf(result?.taskId)
+    if (result === undefined || result.error !== undefined || id === undefined || id === '') return
+    const job = workflowJob({ id, name: stringOf(result.workflowName) }, at)
+    await writeJobs($, deadline, { at, ids: [id] }, jobs => launched(jobs, job))
+  } else if (call.tool === 'ScheduleWakeup') {
+    if (result === undefined) return
+    const dueAt = numberOf(result.scheduledFor)
+    if (result.stopped !== true && dueAt === undefined) return
+    const wakeup = result.stopped === true || dueAt === undefined ? null : wakeupOf(dueAt, stringOf(input.reason), at)
+    await writeWakeup($, deadline, at, () => wakeup, true)
+  } else if (call.tool === 'TaskStop') {
+    // The job ends at the time of the call's result row. The observation is stamped when it applies, so the output
+    // reads of the job since that row, which do not say that it still runs, do not hold the stop back.
+    const id = stringOf(result?.task_id) ?? stringOf(input.task_id) ?? stringOf(input.shell_id)
+    if (id === undefined || id === '') return
+    await writeJobs($, deadline, { at: await $.clock.now(), ids: [id] }, jobs => stoppedJob(jobs, id, at))
+  }
+}
+
+/**
+ * A Bash call that runs in the background: its task id and launch notes from the stored result, else, for a call that
+ * asked for `run_in_background`, from the engine's words at the start of its text, with no launch note. The output file
+ * comes from the text.
+ */
+async function shellLaunched($: EngineInterface, deadline: Deadline, call: RowCall): Promise<void> {
+  const { input, result, at } = call
+  const id = result === undefined ? backgroundIdOf(input, call.text) : stringOf(result.backgroundTaskId)
+  if (id === undefined || id === '') return
+  const outputFile = outputFileOf(call.text, id)
+  if (outputFile === undefined) {
+    report($, rowLabel('Bash'), `no output file in the result of task ${id}; its last line is unavailable`, `path|${id}`)
+  }
+  const launch: { timedOutAfterMs?: number; backgroundedByUser?: boolean; backgroundEndsWithFinalResponse?: boolean } =
+    result === undefined ? {} : { timedOutAfterMs: numberOf(result.timedOutAfterMs), backgroundedByUser: result.backgroundedByUser === true, backgroundEndsWithFinalResponse: result.backgroundEndsWithFinalResponse === true }
+  const note = shellLaunchNote(launch, outputFile !== undefined)
+  const command = stringOf(input.command) ?? ''
+  const redirectFile = await redirectFor($, id, command, call.agentId)
+  await writeJobs($, deadline, { at, ids: [id] }, jobs => launched(jobs, shellJob({ id, command, description: stringOf(input.description), outputFile, redirectFile, note, ownerAgentId: call.agentId, endsWithAgent: launch.backgroundEndsWithFinalResponse === true }, at)))
+  // The history read comes after the launch, so an end or a clear that comes meanwhile is never undone.
+  const history = await historyFor($, command)
+  if (history !== undefined) await writeJobs($, deadline, { at, ids: [id] }, jobs => historyAdded(jobs, id, history))
+}
+
+/**
+ * An Agent call that runs in the background, remotely, or as a teammate, from its stored result; with none, only a
+ * teammate, from the agent id that its text names. Then the agent's rows that came before the launch apply.
+ */
+async function agentLaunched($: EngineInterface, deadline: Deadline, call: RowCall): Promise<void> {
+  const { input, result, at } = call
+  const description = stringOf(input.description) ?? ''
+  const status = stringOf(result?.status)
+  let job: AgentJob | undefined
+  if (result === undefined) {
+    const id = teammateIdOf(call.text)
+    if (id !== undefined) job = agentJob({ id, description }, at)
+  } else if (status === 'teammate_spawned') {
+    // A teammate in a terminal pane of its own runs no loop here: its id is its address in its team.
+    const id = stringOf(result.agentId) ?? stringOf(result.agent_id)
+    const isOwnPane = id !== undefined && id === stringOf(result.teammate_id)
+    if (id !== undefined && id !== '') job = agentJob({ id, description, ...(isOwnPane ? { note: 'own pane', runsElsewhere: true } : {}) }, at)
+  } else if (status === 'async_launched' || status === 'remote_launched') {
+    // A foreground call answers `completed`, and a plugin's own call an AgentCallRecord (no status) once the agent settled: nothing runs.
+    const id = stringOf(status === 'async_launched' ? result.agentId : result.taskId)
+    const title = stringOf(result.description) ?? description
+    if (id !== undefined && id !== '') job = agentJob({ id, description: title, ...(status === 'remote_launched' ? { note: 'remote', runsElsewhere: true } : {}) }, at)
+  }
+  if (job === undefined) return
+  const launch = job
+  await writeJobs($, deadline, { at, ids: [launch.id] }, jobs => launched(jobs, launch))
+  const early = rows.early.get(launch.id)
+  if (early === undefined) return
+  rows.early.delete(launch.id)
+  const now = await $.clock.now()
+  for (const activity of early) {
+    if (now - activity.at <= EARLY_ROWS_MS) await activityApplied($, deadline, launch.id, activity)
+  }
+}
+
+/**
+ * A subagent's tool activity, from its rows: a call starts at its tool_use block and ends at its tool_result block. A
+ * Code Mode script is in flight from its start to its own result, and counts no tool; the calls inside it come as rows
+ * when it settles, each a start and an end at once. The rows of an agent with no row in memory wait EARLY_ROWS_MS for
+ * its launch (see agentLaunched).
+ */
+async function activityRow($: EngineInterface, deadline: Deadline, agentId: string, activity: Activity): Promise<void> {
+  if (!mirror.isLoaded) await loaded($)
+  if (memory.jobs.items.some(job => job.kind === 'agent' && job.id === agentId)) {
+    await activityApplied($, deadline, agentId, activity)
+    return
+  }
+  const early = (rows.early.get(agentId) ?? []).filter(one => activity.at - one.at <= EARLY_ROWS_MS)
+  if (early.length < EARLY_ROWS_MAX) early.push(activity)
+  rows.early.delete(agentId)
+  rows.early.set(agentId, early)
+  capped(rows.early, EARLY_AGENTS_MAX)
+  earlyScheduled($, activity.at)
+}
+
+/**
+ * Drops the rows that waited EARLY_ROWS_MS for their agent's launch: past that age they count nothing (see
+ * agentLaunched). One timer runs at a time, due when the oldest row left passes that age, until no row waits.
+ */
+function earlyScheduled($: EngineInterface, now: number): void {
+  rows.early = earlyKept(rows.early, now, EARLY_ROWS_MS)
+  if (rows.earlyTimer !== null || rows.early.size === 0) return
+  const due = Math.min(...[...rows.early.values()].flatMap(early => early.map(one => one.at))) + EARLY_ROWS_MS + 1
+  rows.earlyTimer = $.clock.after(Math.max(0, due - now), () => {
+    rows.earlyTimer = null
+    earlyScheduled($, due)
+  })
+}
+
+/** Applies one step of a tracked agent's activity; each call id counts once, and OPEN_CALLS_MAX calls are in flight at most. */
+async function activityApplied($: EngineInterface, deadline: Deadline, agentId: string, activity: Activity): Promise<void> {
+  const open = rows.open.get(agentId) ?? new Map<string, { at: number; isCounted: boolean }>()
+  rows.open.set(agentId, open)
+  const observation = { at: activity.at, ids: [agentId], kind: 'activity' } as const
+  if (activity.kind === 'start') {
+    if (open.has(activity.id)) return
+    open.set(activity.id, { at: activity.at, isCounted: activity.isCounted })
+    const size = open.size
+    capped(open, OPEN_CALLS_MAX)
+    const dropped = size - open.size
+    await writeJobs($, deadline, observation, jobs => {
+      const started = activityStarted(jobs, agentId, activity.summary, activity.at, activity.isCounted)
+      return dropped > 0 ? activityClosed(started, agentId, dropped) : started
+    })
+    return
+  }
+  const started = open.get(activity.id)
+  if (started === undefined) return
+  open.delete(activity.id)
+  await writeJobs($, deadline, observation, jobs =>
+    started.isCounted ? activityEnded(jobs, agentId, activity.isFailure, activity.at) : activityClosed(jobs, agentId, 1, activity.at))
+}
+
+/** Closes the calls in flight of an agent that `isDue` picks, with no outcome: at its turn end, and after OPEN_CALL_MS. */
+async function callsClosed($: EngineInterface, deadline: Deadline, agentId: string, now: number, isDue: (call: { at: number }) => boolean): Promise<void> {
+  const open = rows.open.get(agentId)
+  if (open === undefined) return
+  const due = [...open].filter(([, call]) => isDue(call)).map(([id]) => id)
+  if (due.length === 0) return
+  for (const id of due) open.delete(id)
+  await writeJobs($, deadline, { at: now, ids: [agentId], kind: 'activity' }, jobs => activityClosed(jobs, agentId, due.length))
 }
 
 /** Appends clean runs to the duration history, one record at a time; a failure costs the record only and logs once. */
@@ -634,13 +1109,19 @@ async function readTail($: EngineInterface, deadline: Deadline, job: ShellJob & 
   await readApplied($, deadline, job.id, now, found.exitCode, jobs => tailRead(jobs, job.id, found, now, isAnyRatio))
 }
 
-/** Applies `$.agent.list()` to agent jobs; a failed list logs once. */
+/**
+ * Applies `$.agent.list()` to agent jobs; a failed list logs once. Only the listed agents with a row count: a stamp for
+ * an agent with no row would drop its launch, whose stored result can come a moment after the list.
+ */
 async function syncAgents($: EngineInterface, deadline: Deadline, now: number, event = 'clock.every'): Promise<void> {
   const agents = await $.agent.list().catch((error: unknown) => {
     report($, event, `cannot list agents: ${messageOf(error)}`, 'agents')
     return undefined
   })
-  if (agents !== undefined) await writeJobs($, deadline, { at: now, ids: agents.map(agent => agent.id) }, jobs => agentsSynced(jobs, agents, now))
+  if (agents === undefined) return
+  if (!mirror.isLoaded) await loaded($)
+  const ids = agents.filter(agent => memory.jobs.items.some(job => job.kind === 'agent' && job.id === agent.id)).map(agent => agent.id)
+  await writeJobs($, deadline, { at: now, ids }, jobs => agentsSynced(jobs, agents, now))
 }
 
 /** One ticker period: it marks the ticker alive, then refreshes unless a refresh still runs; a failure logs once per message. */
@@ -661,8 +1142,9 @@ async function tick($: EngineInterface): Promise<void> {
 }
 
 /**
- * The work of one tick: settle a switch (see switched), expire the wakeup, sync agents, read outputs (a pending final
- * read too), write a mirror that fell behind, redraw, and stop when nothing is live and no switch waits.
+ * The work of one tick: settle a switch (see switched), expire the wakeup, sync agents, close subagent calls open too
+ * long, read outputs (a pending final read too), write a mirror that fell behind, redraw, and stop when nothing is live
+ * and no switch waits.
  */
 async function refresh($: EngineInterface, now: number): Promise<void> {
   const deadline = deadlineOf()
@@ -671,6 +1153,10 @@ async function refresh($: EngineInterface, now: number): Promise<void> {
   const { jobs: { items: shown }, wakeup: { pending: wakeup } } = viewNow()
   if (wakeupAfterTick(wakeup, now) !== wakeup) await writeWakeup($, deadline, now, current => wakeupAfterTick(current, now))
   if (seen.jobs.items.some(job => job.kind === 'agent' && isRunning(job))) await syncAgents($, deadline, now)
+  for (const agentId of [...rows.open.keys()]) {
+    if (!memory.jobs.items.some(job => job.kind === 'agent' && job.id === agentId)) rows.open.delete(agentId)
+    else await callsClosed($, deadline, agentId, now, call => now - call.at >= OPEN_CALL_MS)
+  }
   for (const job of readsDue(seen.jobs.items, now)) await readTail($, deadline, job, now)
   if (mirror.isBehind) await mirrored($, deadline)
   // Every change replaces the jobs or the wakeup: after a change during this tick, the next tick judges liveness on fresh data.
@@ -691,7 +1177,9 @@ async function pressed($: EngineInterface, control: Control): Promise<void> {
       const now = await $.clock.now()
       await update($, BAND_HIDDEN_AT, () => now)
     } else if (control === 'Clear finished') {
-      await writeJobs($, deadlineOf(), { at: await $.clock.now() }, finishedCleared)
+      const deadline = deadlineOf()
+      await rowsFirst($, deadline, 'ui.press', false)
+      await writeJobs($, deadline, { at: await $.clock.now() }, finishedCleared)
     } else {
       await $.ui.close({ id: PANE_ID })
     }
@@ -799,7 +1287,9 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => passOn($, 'classic.SessionStart{source=clear|resume|fork}', e, next))
 
   on('command.run', { command: COMMAND }, async ($, e) => {
-    await switched($, deadlineOf())
+    const deadline = deadlineOf()
+    await switched($, deadline)
+    await rowsFirst($, deadline, 'command.run', false)
     const argument = e.args.trim()
     if (argument === '') return { text: await tableNow($, e.presentation.columns) }
     if (argument === 'pane') return togglePane($, e.presentation.columns)
@@ -814,10 +1304,12 @@ export const register: Register = (on, options) => {
     // Every slash command settles a pending switch before it runs, waits for the write of a settle that is under way,
     // and writes the view once more when the last mirror write failed, then runs as typed. A command can reload the mod,
     // such as /reload-plugins: the reload empties memory, and the engine reset $.state at the switch, so the view must be
-    // in $.state first (see switched and settleLanded). With no switch pending, no settle in progress, and no write
-    // behind, this hook asks nothing and waits for nothing.
+    // in $.state first (see switched and settleLanded). Calls whose stored result is still being read go on first, so
+    // the reload does not lose them (see rowsFlushed). With no switch pending, no settle in progress, no write behind,
+    // and no call waiting, this hook asks nothing and waits for nothing.
     const deadline = deadlineOf()
     await switched($, deadline)
+    await rowsFlushed($, deadline, 'command.run')
     await settleLanded($, deadline)
     if (mirror.isBehind) await persisted($, deadline)
     return next(e)
@@ -827,141 +1319,51 @@ export const register: Register = (on, options) => {
     // Every /config change settles a pending switch before the row changes, waits for the write of a settle that is
     // under way, and writes the view once more when the last mirror write failed, then changes the row as asked. A change
     // of a Downrange option reloads the mod, and no slash command runs then, so the view must be in $.state first (see
-    // switched and settleLanded). This hook never refuses a change and never changes a value. With no switch pending, no
-    // settle in progress, and no write behind, it asks nothing and waits for nothing.
+    // switched and settleLanded). Calls whose stored result is still being read go on first (see rowsFlushed). This hook
+    // never refuses a change and never changes a value. With no switch pending, no settle in progress, no write behind,
+    // and no call waiting, it asks nothing and waits for nothing.
     const deadline = deadlineOf()
     await switched($, deadline)
+    await rowsFlushed($, deadline, 'config.set')
     await settleLanded($, deadline)
     if (mirror.isBehind) await persisted($, deadline)
     return next(e)
   }).catch(($, e, next) => passOn($, 'config.set', e, next))
 
-  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    const deadline = deadlineOf()
-    await switched($, deadline)
-    const ran = await next(e)
-    if (ran.deny !== undefined || ran.isError === true) return ran
-    const id = ran.result.backgroundTaskId
-    if (id === undefined || id === '') return ran
-    const now = await $.clock.now()
-    const outputFile = outputFileOf(ran.text ?? '', id)
-    if (outputFile === undefined) {
-      report($, 'tool.call', `no output file in the result of task ${id}; its last line is unavailable`, `path|${id}`)
-    }
-    const note = shellLaunchNote(ran.result, outputFile !== undefined)
-    const redirectFile = await redirectFor($, id, e.command, e.agentId)
-    await writeJobs($, deadline, { at: now, ids: [id] }, jobs => launched(jobs, shellJob({ id, command: e.command, description: e.description, outputFile, redirectFile, note, ownerAgentId: e.agentId, endsWithAgent: ran.result.backgroundEndsWithFinalResponse === true }, now)))
-    // The history read comes after the launch, so an end or a clear that comes meanwhile is never undone.
-    const history = await historyFor($, e.command)
-    if (history !== undefined) await writeJobs($, deadline, { at: now, ids: [id] }, jobs => historyAdded(jobs, id, history))
-    return ran
-  }).catch(($, e, next) => passOn($, 'tool.call{tool=Bash}', e, next))
-
-  on('tool.call', { tool: 'Monitor' }, async ($, e, next) => {
-    const deadline = deadlineOf()
-    await switched($, deadline)
-    const ran = await next(e)
-    if (ran.deny !== undefined || ran.isError === true) return ran
-    const now = await $.clock.now()
-    const job = monitorJob({ id: ran.result.taskId, description: e.description, timeoutMs: ran.result.timeoutMs, isPersistent: ran.result.persistent === true }, now)
-    await writeJobs($, deadline, { at: now, ids: [job.id] }, jobs => launched(jobs, job))
-    return ran
-  }).catch(($, e, next) => passOn($, 'tool.call{tool=Monitor}', e, next))
-
-  on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
-    const deadline = deadlineOf()
-    await switched($, deadline)
-    const ran = await next(e)
-    if (ran.deny !== undefined || ran.isError === true) return ran
-    // A foreground call answers `completed`, and a plugin's own call an AgentCallRecord (no status) once the agent settled: nothing runs.
-    const result = ran.result
-    if (!('status' in result) || (result.status !== 'async_launched' && result.status !== 'remote_launched' && result.status !== 'teammate_spawned')) return ran
-    const now = await $.clock.now()
-    // A teammate in a terminal pane of its own runs no loop here: its id is its address in its team.
-    const isOwnPane = result.status === 'teammate_spawned' && (result.agentId ?? result.agent_id) === result.teammate_id
-    const job =
-      result.status === 'teammate_spawned'
-        ? agentJob({ id: result.agentId ?? result.agent_id, description: e.description, ...(isOwnPane ? { note: 'own pane', runsElsewhere: true } : {}) }, now)
-        : result.status === 'async_launched'
-          ? agentJob({ id: result.agentId, description: result.description }, now)
-          : agentJob({ id: result.taskId, description: result.description, note: 'remote', runsElsewhere: true }, now)
-    await writeJobs($, deadline, { at: now, ids: [job.id] }, jobs => launched(jobs, job))
-    return ran
-  }).catch(($, e, next) => passOn($, 'tool.call{tool=Agent}', e, next))
-
-  on('tool.call', { tool: 'Workflow' }, async ($, e, next) => {
-    const deadline = deadlineOf()
-    await switched($, deadline)
-    const ran = await next(e)
-    if (ran.deny !== undefined || ran.isError === true || ran.result.error !== undefined) return ran
-    const now = await $.clock.now()
-    const job = workflowJob({ id: ran.result.taskId, name: ran.result.workflowName }, now)
-    await writeJobs($, deadline, { at: now, ids: [job.id] }, jobs => launched(jobs, job))
-    return ran
-  }).catch(($, e, next) => passOn($, 'tool.call{tool=Workflow}', e, next))
-
-  on('tool.call', { tool: 'ScheduleWakeup' }, async ($, e, next) => {
-    const deadline = deadlineOf()
-    await switched($, deadline)
-    const ran = await next(e)
-    if (ran.deny !== undefined || ran.isError === true) return ran
-    const now = await $.clock.now()
-    const wakeup = ran.result.stopped === true ? null : wakeupOf(ran.result.scheduledFor, e.reason, now)
-    await writeWakeup($, deadline, now, () => wakeup, true)
-    return ran
-  }).catch(($, e, next) => passOn($, 'tool.call{tool=ScheduleWakeup}', e, next))
-
-  on('tool.call', { tool: 'TaskStop' }, async ($, e, next) => {
-    const deadline = deadlineOf()
-    await switched($, deadline)
-    const ran = await next(e)
-    if (ran.deny !== undefined || ran.isError === true) return ran
-    const now = await $.clock.now()
-    const id = ran.result.task_id
-    await writeJobs($, deadline, { at: now, ids: [id] }, jobs => stoppedJob(jobs, id, now))
-    return ran
-  }).catch(($, e, next) => passOn($, 'tool.call{tool=TaskStop}', e, next))
-
-  on('tool.call', async ($, e, next) => {
-    const deadline = deadlineOf()
-    await switched($, deadline)
-    const agentId = e.agentId
-    if (agentId === undefined) return next(e)
-    if (!mirror.isLoaded) await loaded($)
-    if (!memory.jobs.items.some(job => job.kind === 'agent' && job.id === agentId)) return next(e)
-    const started = await $.clock.now()
-    const summary = activityOf(String(e.tool), e)
-    await writeJobs($, deadline, { at: started, ids: [agentId], kind: 'activity' }, jobs => activityStarted(jobs, agentId, summary, started))
-    // A call that rejects counts as failed; the in-flight count drops whatever happens.
-    let isFailure = true
-    try {
-      const ran = await next(e)
-      isFailure = ran.deny !== undefined || ran.isError === true
-      return ran
-    } finally {
-      const settled = await $.clock.now()
-      await writeJobs($, deadline, { at: settled, ids: [agentId], kind: 'activity' }, jobs => activityEnded(jobs, agentId, isFailure, settled))
-    }
-  }).catch(($, e, next) => passOn($, 'tool.call', e, next))
-
   on('session.append', async ($, e, next) => {
+    // A tool call reaches the mod as two rows: the response row that holds its tool_use block, and the result row that
+    // holds its tool_result block once it ended (see responseApplied and resultApplied). Inside a Code Mode script, both rows come when the
+    // script settles. A subagent's stored task notification is a row too. Every other row passes on at once.
     const deadline = deadlineOf()
     await switched($, deadline)
-    if (e.agentId === undefined || e.origin.kind !== 'task-notification') return next(e)
-    const now = await $.clock.now()
+    const isNotice = e.agentId !== undefined && e.origin.kind === 'task-notification'
+    if (!isNotice && e.door !== 'response' && e.door !== 'tool-result') return next(e)
+    // A main-loop response row needs no time: it only keeps the inputs of its calls.
+    const now = isNotice || e.door === 'tool-result' || e.agentId !== undefined ? await $.clock.now() : null
     const stored = await next(e)
     if (stored.deny !== undefined || stored.uuid !== e.uuid) return stored
-    const text = stored.message.content.flatMap(block => block.type === 'text' && 'text' in block && typeof block.text === 'string' ? [block.text] : []).join('\n')
-    await applyNotices($, deadline, text, JSON.stringify([e.agentId, stored.uuid]), now)
+    const row: Row = { uuid: stored.uuid, agentId: e.agentId, tool: e.origin.kind === 'tool' ? e.origin.tool : undefined, content: stored.message.content }
+    if (isNotice) {
+      await rowsFirst($, deadline, 'session.append', true)
+      const text = stored.message.content.flatMap(block => block.type === 'text' && 'text' in block && typeof block.text === 'string' ? [block.text] : []).join('\n')
+      await applyNotices($, deadline, text, JSON.stringify([e.agentId, stored.uuid]), now ?? undefined)
+    } else if (e.door === 'response') {
+      await responseApplied($, deadline, row, now)
+    } else if (now !== null) {
+      await resultApplied($, deadline, row, now)
+    }
     return stored
   }).catch(($, e, next) => passOn($, 'session.append', e, next))
 
   on('turn.complete', async ($, e, next) => {
     const deadline = deadlineOf()
     await switched($, deadline)
+    await rowsFirst($, deadline, 'turn.complete', true)
     const now = await $.clock.now()
     const result = await next(e)
     const agentId = e.agentId
+    // A turn end leaves no call of its loop in flight.
+    if (agentId !== undefined) await callsClosed($, deadline, agentId, now, () => true)
     if (agentId !== undefined && e.reason === 'answer' && !e.isAborted) await writeJobs($, deadline, { at: now }, jobs => ownerAnswered(jobs, agentId, now))
     // A subagent's turn end reads the agent list. A main-loop turn end runs the agent sync of classic.Stop and
     // classic.SubagentStop too: under managed settings or a Team or Enterprise login, those events do not reach the
@@ -971,9 +1373,11 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => passOn($, 'turn.complete', e, next))
 
   on('prompt.submit', async ($, e, next) => {
-    // The status answer reads the view, so a switch settles before it.
+    // The status answer reads the view, so a switch settles before it, and a launch whose stored result is still being
+    // read applies before it, as before a notification.
     const deadline = deadlineOf()
     await switched($, deadline)
+    await rowsFirst($, deadline, 'prompt.submit', e.origin.kind === 'task-notification')
     if (e.origin.kind === 'task-notification') {
       await applyNotices($, deadline, e.text)
     } else if (e.origin.kind === 'scheduled-trigger') {
@@ -989,6 +1393,7 @@ export const register: Register = (on, options) => {
   on('classic.Stop', async ($, e, next) => {
     const deadline = deadlineOf()
     await switched($, deadline)
+    await rowsFirst($, deadline, 'classic.Stop', true)
     await reconcile($, deadline, 'classic.Stop', e)
     if (memory.jobs.items.some(job => job.kind === 'agent')) await syncAgents($, deadline, await $.clock.now(), 'classic.Stop')
     return next(e)
@@ -997,6 +1402,7 @@ export const register: Register = (on, options) => {
   on('classic.SubagentStop', async ($, e, next) => {
     const deadline = deadlineOf()
     await switched($, deadline)
+    await rowsFirst($, deadline, 'classic.SubagentStop', true)
     await reconcile($, deadline, 'classic.SubagentStop', e)
     if (memory.jobs.items.some(job => job.kind === 'agent')) await syncAgents($, deadline, await $.clock.now(), 'classic.SubagentStop')
     return next(e)

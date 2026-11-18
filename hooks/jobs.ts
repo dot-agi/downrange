@@ -473,6 +473,7 @@ const DETAILS: ReadonlyMap<string, Detail> = new Map([
   ['WebFetch', { field: 'url', shape: 'host' }],
   ['WebSearch', { field: 'query', shape: 'text' }],
   ['Agent', { field: 'description', shape: 'text' }],
+  ['REPL', { field: 'description', shape: 'text' }],
 ])
 
 function detailOf(value: string, shape: Detail['shape']): string {
@@ -508,13 +509,13 @@ export function activityOf(tool: string, input: object): string {
   return clip(oneLine(text), ACTIVITY_MAX)
 }
 
-/** The list after a tracked subagent started a tool call. */
-export function activityStarted(jobs: readonly Job[], agentId: string, summary: string, now: number): Job[] {
+/** The list after a tracked subagent started a tool call; a Code Mode script (`isCounted` false) is in flight but no tool of the count. */
+export function activityStarted(jobs: readonly Job[], agentId: string, summary: string, now: number, isCounted = true): Job[] {
   return jobs.map(job =>
     job.kind === 'agent' && job.id === agentId
       ? {
           ...job,
-          toolCount: job.toolCount + 1,
+          toolCount: job.toolCount + (isCounted ? 1 : 0),
           inFlight: job.inFlight + 1,
           lastLine: now >= (job.lastToolStartedAt ?? -Infinity) ? summary : job.lastLine,
           lastToolStartedAt: Math.max(job.lastToolStartedAt ?? now, now),
@@ -543,6 +544,25 @@ export function activityEnded(jobs: readonly Job[], agentId: string, isFailure: 
       concurrentFailureTimes: inFlight === 0 ? undefined : failures,
       lastSuccessAt: inFlight === 0 ? undefined : lastSuccessAt,
       lastOutputAt: Math.max(job.lastOutputAt ?? now, now),
+    }
+  })
+}
+
+/**
+ * The list after `count` of a tracked subagent's calls closed with no outcome: a Code Mode script's own result, which
+ * says only that the script runs, or calls that its turn end or their age closed. The failure streak stays. `outputAt`,
+ * when given, counts as activity of the agent.
+ */
+export function activityClosed(jobs: readonly Job[], agentId: string, count: number, outputAt?: number): Job[] {
+  return jobs.map(job => {
+    if (job.kind !== 'agent' || job.id !== agentId) return job
+    const inFlight = Math.max(0, job.inFlight - count)
+    return {
+      ...job,
+      inFlight,
+      concurrentFailureTimes: inFlight === 0 ? undefined : job.concurrentFailureTimes,
+      lastSuccessAt: inFlight === 0 ? undefined : job.lastSuccessAt,
+      lastOutputAt: outputAt === undefined ? job.lastOutputAt : Math.max(job.lastOutputAt ?? outputAt, outputAt),
     }
   })
 }
@@ -577,10 +597,12 @@ const isKnownOrAbsent = (value: { isGeneric?: boolean } | undefined): boolean =>
  * The list after a reload of the mod at `now`, as a change of the `genericRatios` option or an update causes. With
  * isAnyRatio off, a reading or an anchor that is generic or has no mark drops, and an anchor drops with its reading.
  * Each running shell with an output file reads it once more in full, so its row follows the current option. A Monitor
- * cannot read its old events again: its next event follows the option.
+ * cannot read its old events again: its next event follows the option. A subagent has no call in flight: the reload
+ * forgot which calls were open, so no later result row can close them.
  */
 export function reloaded(jobs: readonly Job[], isAnyRatio: boolean, now: number): Job[] {
   return jobs.map(job => {
+    if (job.kind === 'agent') return job.inFlight === 0 ? job : { ...job, inFlight: 0, concurrentFailureTimes: undefined, lastSuccessAt: undefined }
     if (job.kind !== 'shell' && job.kind !== 'monitor') return job
     const isGenericDropped = !isAnyRatio && (!isKnownOrAbsent(job.progress) || !isKnownOrAbsent(job.anchor))
     const isReread = job.kind === 'shell' && isRunning(job) && job.outputFile !== undefined
