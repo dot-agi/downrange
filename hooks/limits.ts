@@ -78,3 +78,34 @@ export const NOTICE_ROWS_MAX = 256
 export const MIRROR_WAIT_MS = 2_000
 /** Sessions of one process whose start time for Finished stays in memory, for a /resume back to them; the oldest goes first. */
 export const MAX_SESSIONS = 32
+/** The waits after a call's result row of the reads of its stored result, in ms; after the last read, the call has no result. */
+export const LOOKUP_DELAYS_MS: readonly number[] = [0, 50, 100, 250, 1_000, 3_000]
+/** Newest rows that a read of stored results asks for when it cannot read on from the call's own response row. */
+export const LOOKUP_LAST = 8
+/** A result row that a read still lists this long after it came, with no stored result, makes that read also ask for the newest rows. */
+export const BARE_RESULT_MS = 250
+/** Characters that a call which waits for its stored result keeps of its result text: from its start, and from each output notice on (see keptTextOf). */
+export const KEPT_TEXT_MAX = 2_048
+/** The longest Monitor deadline: the Monitor tool caps a larger `timeout_ms` to this. */
+export const MONITOR_TIMEOUT_MAX_MS = 1_800_000
+/** Inputs of tool calls kept until their result row comes; the oldest goes first. */
+export const INPUTS_MAX = 512
+/** Result rows that wait for their stored result; past it, the oldest goes on with its text only. */
+export const WAITING_MAX = 256
+/** Tool use ids kept so that no call applies twice; the oldest goes first. */
+export const DELIVERED_MAX = 2_000
+/** A result row this young at a notification, a snapshot, or a turn end waits until this age for its stored result, which Claude Code stores about 55 ms after the row. */
+export const FIRST_HOLD_MS = 100
+/** The longest wait for stored results before a notification, a snapshot, a turn end, the table, or Clear finished applies. */
+export const FIRST_WAIT_MS = 2_000
+/** The longest wait for stored results before a slash command or a /config change, which can reload the mod. */
+export const FLUSH_WAIT_MS = 1_000
+/** Rows of an agent that Downrange does not track yet wait this long at most for its launch, this many per agent. */
+export const EARLY_ROWS_MS = 5_000
+export const EARLY_ROWS_MAX = 64
+/** Agents whose rows wait for their launch at once; the oldest goes first. */
+export const EARLY_AGENTS_MAX = 32
+/** Tool calls of one agent that count as in flight at once; past it, the oldest closes. */
+export const OPEN_CALLS_MAX = 64
+/** A subagent's tool call with no result row for this long (2 hours) closes. */
+export const OPEN_CALL_MS = 7_200_000

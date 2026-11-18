@@ -1,5 +1,5 @@
 import type { Anchor, Progress } from '../types'
-import { COUNTER_CONTEXT, ETA_MIN_GAIN, ETA_MIN_SPAN_MS, TAIL_BYTES } from './limits'
+import { COUNTER_CONTEXT, ETA_MIN_GAIN, ETA_MIN_SPAN_MS, KEPT_TEXT_MAX, TAIL_BYTES } from './limits'
 
 const ANSI = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][\s\S]*?(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g
 const CONTROL = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g
@@ -172,6 +172,20 @@ export function outputFileOf(text: string, id: string): string | undefined {
     notice = notice === 0 ? -1 : text.lastIndexOf(OUTPUT_NOTICE, notice - 1)
   }
   return undefined
+}
+
+/**
+ * What a call that waits for its stored result keeps of its result text: its first KEPT_TEXT_MAX characters, where the
+ * engine's words stand, and KEPT_TEXT_MAX characters of each line that holds the output notice, from the notice on. A
+ * path holds no line break, so outputFileOf finds in that the path it finds in the whole text.
+ */
+export function keptTextOf(text: string): string {
+  if (text.length <= KEPT_TEXT_MAX) return text
+  const notices = text.split('\n').flatMap(line => {
+    const at = line.indexOf(OUTPUT_NOTICE)
+    return at === -1 ? [] : [line.slice(at, at + KEPT_TEXT_MAX)]
+  })
+  return [text.slice(0, KEPT_TEXT_MAX), ...notices].join('\n')
 }
 
 /** The exit code on the engine's closing `[exited with code N]` line, when the lines of an output end with it: the command ended. */
